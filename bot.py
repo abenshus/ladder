@@ -1,8 +1,10 @@
 """
-Ladder on the server: runs the ladder manager for one TradeLocker account and a Discord control panel.
+Ladder on the server: runs one or more ladders ("משכפלים"), each a ladder manager on its own TradeLocker account
+with its own on/off and settings, and a Discord control panel per ladder.
 
-#ladder (CONTROL_CHANNEL_ID): one pinned panel message, edited in place -
-  on/off, account picker, mode / BE / runner / SL-delete toggles, settings modal.
+#ladder (CONTROL_CHANNEL_ID): a pinned header on top (list of ladders, add / delete) and under it one panel
+  message per ladder, edited in place - on/off, account picker, mode / BE / runner / SL-delete toggles, settings modal.
+  Two ladders never share an account (each trade would be laddered twice).
 #ladder-log: everything the manager reports (via DISCORD_WEBHOOK; errors also go to DISCORD_WEBHOOK_ALERT).
 
 "Off" only stops laddering NEW trades - open groups keep their SL synced, so nothing is left unmanaged.
@@ -68,11 +70,19 @@ def account_notes():
 # ======================================================================
 class Settings:
     def __init__(self):
-        self.data = {"account": os.environ.get("TL_ACCOUNT_ID", ""), "panel_message": 0,
-                     "params": {"enabled": False}, "limits": {}}     # limits: account -> max lots of a whole ladder
+        # ladders: [{id, account, panel_message, params}]; limits: account -> max lots of a whole ladder (per account)
+        self.data = {"header_message": 0, "ladders": [], "limits": {}}
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE) as f:
-                self.data.update(json.load(f))
+                loaded = json.load(f)
+            if "ladders" not in loaded:
+                # before there were several ladders: the one account/params becomes ladder 1
+                loaded["ladders"] = [{"id": 1, "account": loaded.pop("account", ""),
+                                      "panel_message": loaded.pop("panel_message", 0),
+                                      "params": loaded.pop("params", {"enabled": False})}]
+            self.data.update(loaded)
+        if not self.data["ladders"]:
+            self.new_ladder(os.environ.get("TL_ACCOUNT_ID", ""))
 
     def save(self):
         tmp = SETTINGS_FILE + ".tmp"
@@ -80,27 +90,44 @@ class Settings:
             json.dump(self.data, f, indent=1)
         os.replace(tmp, SETTINGS_FILE)
 
-    def params(self):
+    def new_ladder(self, account=""):
+        lid = max([lad["id"] for lad in self.data["ladders"]] + [0]) + 1
+        ladder = {"id": lid, "account": account, "panel_message": 0, "params": {"enabled": False}}
+        self.data["ladders"].append(ladder)
+        self.save()
+        return ladder
+
+    def params(self, ladder):
         params = dict(lm.PARAMS)
         params["active"] = True
-        for key, value in self.data["params"].items():
+        for key, value in ladder["params"].items():
             if key in EDITABLE:
                 params[key] = value
         return params
 
 
 # ======================================================================
-# Engine: one LadderManager thread for the chosen account, restarted if it crashes
+# Engine: one ladder = one LadderManager thread for its account, restarted if it crashes
 # ======================================================================
 class Engine:
-    def __init__(self, settings):
+    def __init__(self, settings, ladder):
         self.settings = settings
-        self.params = settings.params()     # shared with the running manager - edits apply on its next tick
+        self.ladder = ladder                # its entry in settings.data["ladders"]
+        self.lid = ladder["id"]
+        self.params = settings.params(ladder)   # shared with the running manager - edits apply on its next tick
         self.manager = None
         self.stop = None
         self.thread = None
         self.error = ""
         self.last = ""      # the panel's "last update" line: startup, errors, what a button did
+
+    @property
+    def name(self):
+        return f"משכפל {self.lid}"
+
+    @property
+    def account(self):
+        return self.ladder["account"]
 
     def note(self, text):
         self.last = f"{text} · {time.strftime('%H:%M:%S')}"
@@ -116,6 +143,7 @@ class Engine:
         if not account:
             return
         self.params["max_total_lots"] = self.limit(account)
+        self.params["label"] = f"{self.name} · {account_label(account)}"
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._supervise, args=(str(account), self.stop), daemon=True)
         self.thread.start()
@@ -156,18 +184,26 @@ class Engine:
     def set_limit(self, account, lots):
         self.settings.data["limits"][account] = lots
         self.settings.save()
-        if account == self.settings.data["account"]:
+        if account == self.account:
             self.params["max_total_lots"] = lots
 
     def set(self, key, value):
         self.params[key] = value
-        self.settings.data["params"][key] = value
+        self.ladder["params"][key] = value
         self.settings.save()
 
     def open_groups(self):
         if self.manager is None or self.manager.summary is None:
             return []
         return [g for g in self.manager.summary["groups"] if g["members"] > 0 or g["kind"] == "pending"]
+
+    def status_line(self):
+        p = self.params
+        acc = account_label(self.account) if self.account else "בלי חשבון"
+        groups = self.open_groups()
+        return (f"**{self.name}** · {acc} · {'🟢 פועל' if p['enabled'] and self.account else '🔴 כבוי'} · "
+                f"{'שכפול' if p['mode'] == 'duplicate' else 'חלוקה'} ×{p['copies']}"
+                + (f" · {len(groups)} קבוצות פתוחות" if groups else ""))
 
 
 def list_accounts():
@@ -209,16 +245,24 @@ def after_tp1_text(p):
     return f"ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$"
 
 
-def panel_embed(engine, settings):
+def header_embed(engines):
+    lines = [e.status_line() for e in engines] or ["אין משכפלים - לחץ ➕ כדי להוסיף"]
+    lines += ["", "כל משכפל רץ על חשבון משלו עם הדלקה והגדרות משלו. הלוחות שלהם מתחת להודעה הזאת."]
+    return discord.Embed(title="🪜 משכפלים", description="\n".join(lines), color=0x3498db)
+
+
+def panel_embed(engine):
     """The panel as plain lines, one setting per line (inline fields read badly in Hebrew)."""
     p = engine.params
-    on = p["enabled"]
-    key = settings.data["account"]
+    key = engine.account
+    on = p["enabled"] and bool(key)
     acc = account_label(key) if key else "—"
     note = account_notes().get(split_key(key)[1]) if key else None
     cap = p["max_total_lots"]
     lines = [
-        "🟢 **פועל** - משכפל עסקאות חדשות" if on else "🔴 **כבוי** - לא משכפל עסקאות חדשות (קבוצות פתוחות ממשיכות לקבל סנכרון SL)",
+        "🟢 **פועל** - משכפל עסקאות חדשות" if on
+        else "⚪ **בחר חשבון** בתפריט למטה" if not key
+        else "🔴 **כבוי** - לא משכפל עסקאות חדשות (קבוצות פתוחות ממשיכות לקבל סנכרון SL)",
         "",
         f"**חשבון:** {acc}" + (f"  ⚠️ {note}" if note else ""),
         f"**מצב:** {'חלוקה (split) - הלוט שלך מתחלק' if p['mode'] == 'split' else 'שכפול (duplicate) - כל עסקה בלוט שלך'}",
@@ -239,17 +283,18 @@ def panel_embed(engine, settings):
         lines.append("**קבוצות פתוחות:** אין")
     if engine.last:
         lines += ["", f"**עדכון אחרון:** {engine.last}"]
-    embed = discord.Embed(title="🪜 Ladder", description="\n".join(lines), color=0x2ecc71 if on else 0xe74c3c)
-    status = "מחובר" if engine.manager and engine.manager.summary else "מתחבר…"
+    embed = discord.Embed(title=f"🪜 {engine.name}" + (f" · {account_label(key)}" if key else ""),
+                          description="\n".join(lines), color=0x2ecc71 if on else 0xe74c3c)
+    status = "מחובר" if engine.manager and engine.manager.summary else "מתחבר…" if key else "לא מחובר"
     if engine.error:
         status = f"⚠️ {engine.error}"
     embed.set_footer(text=f"{status} · עודכן {time.strftime('%H:%M:%S')}")
     return embed
 
 
-class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
+class SettingsModal(discord.ui.Modal):
     def __init__(self, panel):
-        super().__init__()
+        super().__init__(title=f"הגדרות {panel.engine.name}")
         self.panel = panel
         p = panel.engine.params
         self.copies = discord.ui.TextInput(label="כמה עסקאות בסך הכול (2-10)", default=str(p["copies"]), max_length=2)
@@ -279,7 +324,7 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
                 "ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100, BE offset בין 0 למרחק ה-TP, נעילת TP1 בין 0 ל-1, מקסימום אונקיות 0-500.",
                 ephemeral=True)
             return
-        account = self.panel.settings.data["account"]
+        account = self.panel.engine.account
         if account:
             self.panel.engine.set_limit(account, max_lots)
         self.panel.engine.set("copies", copies)
@@ -301,7 +346,8 @@ class ConfirmSwitch(discord.ui.View):
     async def yes(self, interaction, button):
         await interaction.response.edit_message(content=f"מחליף לחשבון {account_label(self.account)}…", view=None)
         await self.panel.switch(self.account)
-        await interaction.edit_original_response(content=f"✅ השרת עבר לחשבון {account_label(self.account)}")
+        await interaction.edit_original_response(
+            content=f"✅ {self.panel.engine.name} עבר לחשבון {account_label(self.account)}")
 
     @discord.ui.button(label="ביטול", style=discord.ButtonStyle.secondary)
     async def no(self, interaction, button):
@@ -309,17 +355,22 @@ class ConfirmSwitch(discord.ui.View):
 
 
 class AccountSelect(discord.ui.Select):
-    def __init__(self, panel, accounts, current):
-        options = [discord.SelectOption(label=label, value=acc, default=acc == current) for acc, label in accounts[:25]]
+    def __init__(self, panel, accounts, current, taken):
+        # an account another ladder runs on is left out: two managers would ladder every trade twice
+        options = [discord.SelectOption(label=label, value=acc, default=acc == current)
+                   for acc, label in accounts if acc not in taken][:25]
         if not options:
-            options = [discord.SelectOption(label="לא נמצאו חשבונות - לחץ רענן", value="none")]
-        super().__init__(placeholder="בחר חשבון", options=options, custom_id="ladder:account", row=2)
+            options = [discord.SelectOption(label="לא נמצאו חשבונות פנויים - לחץ רענן", value="none")]
+        super().__init__(placeholder="בחר חשבון", options=options, custom_id=f"ladder:account:{panel.engine.lid}", row=2)
         self.panel = panel
 
     async def callback(self, interaction):
         account = self.values[0]
-        if account == "none" or account == self.panel.settings.data["account"]:
+        if account == "none" or account == self.panel.engine.account:
             await interaction.response.defer()
+            return
+        if account in self.panel.bot.taken_accounts(self.panel.engine):
+            await interaction.response.send_message("החשבון הזה כבר רץ במשכפל אחר.", ephemeral=True, delete_after=15)
             return
         warn = []
         groups = self.panel.engine.open_groups()
@@ -338,17 +389,18 @@ class AccountSelect(discord.ui.Select):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.panel.switch(account)
-        await interaction.followup.send(f"✅ השרת עבר לחשבון {account_label(account)}", ephemeral=True)
+        await interaction.followup.send(f"✅ {self.panel.engine.name} עבר לחשבון {account_label(account)}", ephemeral=True)
 
 
 class Panel(discord.ui.View):
-    def __init__(self, bot, engine, settings, accounts):
+    def __init__(self, bot, engine):
         super().__init__(timeout=None)
         self.bot = bot
         self.engine = engine
-        self.settings = settings
-        self.accounts = accounts
-        self.add_item(AccountSelect(self, accounts, settings.data["account"]))
+        self.settings = engine.settings
+        for item in self.children:      # one panel per ladder: its buttons need their own ids
+            item.custom_id = f"{item.custom_id}:{engine.lid}"
+        self.add_item(AccountSelect(self, bot.accounts, engine.account, bot.taken_accounts(engine)))
 
     async def interaction_check(self, interaction):
         if interaction.user.id != ALLOWED_USER_ID:
@@ -368,6 +420,9 @@ class Panel(discord.ui.View):
 
     @discord.ui.button(label="הדלק", emoji="🟢", style=discord.ButtonStyle.success, custom_id="ladder:on", row=0)
     async def on(self, interaction, button):
+        if not self.engine.account:
+            await interaction.response.send_message("קודם בחר חשבון בתפריט.", ephemeral=True, delete_after=15)
+            return
         await self._toggle(interaction, "enabled", True, "🟢 הופעל - משכפל עסקאות חדשות")
 
     @discord.ui.button(label="כבה", emoji="🔴", style=discord.ButtonStyle.danger, custom_id="ladder:off", row=0)
@@ -416,23 +471,90 @@ class Panel(discord.ui.View):
                            "🚫 מחיקת SL: " + ("מוחקת מכולן" if new else "מחזירה את ה-SL"))
 
     async def switch(self, account):
-        self.settings.data["account"] = account
+        self.engine.ladder["account"] = account
         self.settings.save()
         await asyncio.to_thread(self.engine.start, account)
         self.engine.note(f"🔁 עבר לחשבון {account_label(account)}")
-        await self.refresh()
+        await self.bot.render_all()     # the other panels' account lists change too
 
     async def refresh(self):
-        await self.bot.render_panel()
+        await self.bot.render_panel(self.engine)
+        await self.bot.render_header()
+
+
+# ======================================================================
+# Header: list of ladders, add / delete
+# ======================================================================
+class ConfirmDelete(discord.ui.View):
+    def __init__(self, bot, engine):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.engine = engine
+
+    @discord.ui.button(label="כן, למחוק", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction, button):
+        await interaction.response.edit_message(content=f"מוחק את {self.engine.name}…", view=None)
+        await self.bot.delete_ladder(self.engine)
+        await interaction.edit_original_response(content=f"🗑 {self.engine.name} נמחק")
+
+    @discord.ui.button(label="ביטול", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction, button):
+        await interaction.response.edit_message(content="בוטל.", view=None)
+
+
+class DeleteSelect(discord.ui.Select):
+    def __init__(self, bot):
+        options = [discord.SelectOption(label=e.status_line().replace("**", "")[:100], value=str(e.lid))
+                   for e in bot.engines]
+        super().__init__(placeholder="איזה משכפל למחוק?", options=options)
+        self.bot = bot
+
+    async def callback(self, interaction):
+        engine = next(e for e in self.bot.engines if str(e.lid) == self.values[0])
+        warn = [f"למחוק את **{engine.name}**" + (f" ({account_label(engine.account)})" if engine.account else "") + "?"]
+        groups = engine.open_groups()
+        if groups:
+            warn.append(f"⚠️ יש לו {len(groups)} קבוצות פתוחות - אחרי המחיקה ה-SL שלהן לא יסונכרן יותר.")
+        await interaction.response.edit_message(content="\n".join(warn), view=ConfirmDelete(self.bot, engine))
+
+
+class Header(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("אין לך הרשאה ללוח הזה.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="משכפל חדש", emoji="➕", style=discord.ButtonStyle.success, custom_id="ladder:add")
+    async def add(self, interaction, button):
+        engine = await self.bot.add_ladder()
+        await interaction.response.send_message(f"➕ נוסף {engine.name} (כבוי) - בחר לו חשבון בלוח שלו למטה.",
+                                                ephemeral=True, delete_after=15)
+
+    @discord.ui.button(label="מחק משכפל", emoji="🗑", style=discord.ButtonStyle.danger, custom_id="ladder:delete")
+    async def delete(self, interaction, button):
+        if not self.bot.engines:
+            await interaction.response.send_message("אין משכפלים.", ephemeral=True, delete_after=15)
+            return
+        view = discord.ui.View(timeout=60)
+        view.add_item(DeleteSelect(self.bot))
+        await interaction.response.send_message("בחר משכפל למחיקה:", view=view, ephemeral=True)
 
 
 class LadderBot(discord.Client):
-    def __init__(self, engine, settings):
+    def __init__(self, engines, settings):
         super().__init__(intents=discord.Intents.default())
-        self.engine = engine
+        self.engines = engines
         self.settings = settings
         self.accounts = []
         self.panel_lock = asyncio.Lock()
+
+    def taken_accounts(self, engine):
+        return {e.account for e in self.engines if e is not engine and e.account}
 
     async def reload_accounts(self):
         try:
@@ -442,19 +564,58 @@ class LadderBot(discord.Client):
 
     async def setup_hook(self):
         await self.reload_accounts()
-        self.add_view(Panel(self, self.engine, self.settings, self.accounts))     # buttons work after restarts
+        self.add_view(Header(self))     # buttons work after restarts
+        for engine in self.engines:
+            self.add_view(Panel(self, engine))
         self.loop.create_task(self._refresher())
 
     async def on_ready(self):
         log.info(f"discord ready as {self.user}")
-        await self.render_panel()
+        await self.render_all()
 
-    async def render_panel(self):
+    async def _channel(self):
+        return self.get_channel(CONTROL_CHANNEL_ID) or await self.fetch_channel(CONTROL_CHANNEL_ID)
+
+    async def render_all(self):
+        await self.render_header()
+        for engine in self.engines:
+            await self.render_panel(engine)
+
+    async def render_header(self):
         async with self.panel_lock:
-            channel = self.get_channel(CONTROL_CHANNEL_ID) or await self.fetch_channel(CONTROL_CHANNEL_ID)
-            view = Panel(self, self.engine, self.settings, self.accounts)
-            embed = panel_embed(self.engine, self.settings)
-            msg_id = self.settings.data["panel_message"]
+            channel = await self._channel()
+            msg_id = self.settings.data["header_message"]
+            if msg_id:
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                    await msg.edit(embed=header_embed(self.engines), view=Header(self))
+                    return
+                except discord.NotFound:
+                    pass
+            # the header goes on top: repost the panels under it
+            for ladder in self.settings.data["ladders"]:
+                if ladder["panel_message"]:
+                    try:
+                        await (await channel.fetch_message(ladder["panel_message"])).delete()
+                    except discord.HTTPException:
+                        pass
+                    ladder["panel_message"] = 0
+            msg = await channel.send(embed=header_embed(self.engines), view=Header(self))
+            self.settings.data["header_message"] = msg.id
+            self.settings.save()
+            try:
+                await msg.pin()
+            except discord.HTTPException as exc:
+                log.warning(f"pin failed: {exc}")
+
+    async def render_panel(self, engine):
+        async with self.panel_lock:
+            if engine not in self.engines:
+                return
+            channel = await self._channel()
+            view = Panel(self, engine)
+            embed = panel_embed(engine)
+            msg_id = engine.ladder["panel_message"]
             if msg_id:
                 try:
                     msg = await channel.fetch_message(msg_id)
@@ -463,27 +624,51 @@ class LadderBot(discord.Client):
                 except discord.NotFound:
                     pass
             msg = await channel.send(embed=embed, view=view)
-            self.settings.data["panel_message"] = msg.id
+            engine.ladder["panel_message"] = msg.id
             self.settings.save()
+
+    async def add_ladder(self):
+        engine = Engine(self.settings, self.settings.new_ladder())
+        self.engines.append(engine)
+        self.add_view(Panel(self, engine))
+        await self.render_header()
+        await self.render_panel(engine)
+        return engine
+
+    async def delete_ladder(self, engine):
+        await asyncio.to_thread(engine.stop_engine)
+        self.engines.remove(engine)
+        self.settings.data["ladders"].remove(engine.ladder)
+        self.settings.save()
+        if engine.ladder["panel_message"]:
             try:
-                await msg.pin()
-            except discord.HTTPException as exc:
-                log.warning(f"pin failed: {exc}")
+                await (await (await self._channel()).fetch_message(engine.ladder["panel_message"])).delete()
+            except discord.HTTPException:
+                pass
+        await self.render_all()     # its account is free again in the other panels
 
     async def _refresher(self):
         await self.wait_until_ready()
-        last = None
+        last = {}
         while not self.is_closed():
             await asyncio.sleep(10)
             # edit only when something visible changed (Discord rate-limits edits)
-            key = json.dumps([self.engine.open_groups(), self.engine.error, self.engine.last, self.engine.manager is not None
-                              and self.engine.manager.summary is not None], default=str)
-            if key != last:
-                last = key
+            for engine in list(self.engines):
+                key = json.dumps([engine.open_groups(), engine.error, engine.last,
+                                  engine.manager is not None and engine.manager.summary is not None], default=str)
+                if key != last.get(engine.lid):
+                    last[engine.lid] = key
+                    try:
+                        await self.render_panel(engine)
+                    except Exception as exc:
+                        log.warning(f"panel refresh failed: {exc}")
+            key = json.dumps([e.status_line() for e in self.engines])
+            if key != last.get("header"):
+                last["header"] = key
                 try:
-                    await self.render_panel()
+                    await self.render_header()
                 except Exception as exc:
-                    log.warning(f"panel refresh failed: {exc}")
+                    log.warning(f"header refresh failed: {exc}")
 
 
 def main():
@@ -494,9 +679,10 @@ def main():
     logging.getLogger("discord").setLevel(logging.WARNING)
     os.makedirs(DATA_DIR, exist_ok=True)
     settings = Settings()
-    engine = Engine(settings)
-    engine.start(settings.data["account"])
-    LadderBot(engine, settings).run(os.environ["LADDER_DISCORD_TOKEN"], log_handler=None)
+    engines = [Engine(settings, ladder) for ladder in settings.data["ladders"]]
+    for engine in engines:
+        engine.start(engine.account)
+    LadderBot(engines, settings).run(os.environ["LADDER_DISCORD_TOKEN"], log_handler=None)
 
 
 if __name__ == "__main__":

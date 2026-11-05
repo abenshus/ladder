@@ -67,6 +67,7 @@ PARAMS = dict(
     tick_seconds=1.0,           # ב-stream: בדיקה גם בלי אירוע (ניסיונות חוזרים של SL)
     poll_seconds=2.0,           # בלי stream: מגבלת השרת 1 קריאה לשנייה ל-positions/orders (משותפת עם הטרמינל)
     price_decimals=2,
+    label="",                   # שם שנוסף לכל הודעה בלוג (כמה משכפלים על אותו ערוץ)
     strategy_tag="LAD",         # strategyId של העסקאות שהשירות פותח
     manual_tags="",             # strategyId נוספים שנחשבים ידני, מופרדים בפסיק (בדיקות: key-undefined = API בלי strategy)
     sl_retry_seconds=4.0,       # אם ה-SL לא התעדכן אחרי X שניות - מנסים שוב / דרך אחרת
@@ -293,7 +294,8 @@ class LadderManager:
         return abs(float(a) - float(b)) < 0.5 * 10 ** -self.p["price_decimals"]
 
     def _broadcast(self, header, lines):
-        text = header + "\n" + "\n".join(f"• {line}" for line in lines)
+        # several ladders share the log channel: say whose message it is
+        text = header + (f" · {self.p['label']}" if self.p["label"] else "") + "\n" + "\n".join(f"• {line}" for line in lines)
         if not self.p["active"]:
             text += "\n" + self._t("dry")
         log.info(text.replace("<b>", "").replace("</b>", ""))

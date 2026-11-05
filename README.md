@@ -18,15 +18,16 @@ Live data comes from the TradeLocker **Streams API** (developer key), orders go 
 | File | What |
 |---|---|
 | `ladder_manager.py` | the engine (stream mirror, ladder, SL sync, BE). Also a CLI: `./run_local.sh --active --mode duplicate --tp-step 5 ...` |
-| `bot.py` | what the server runs: the engine for one chosen account + a Discord control panel |
+| `bot.py` | what the server runs: one engine per ladder (each on its own account) + Discord control panels |
 | `run_bot_local.sh` | the server setup on this Mac, secrets from the Keychain |
 
 ## Discord
 
-- `#ladder`: one panel message (on/off, account picker, split/duplicate, BE, runner, SL-delete, settings incl. the
-  per-account cap in ounces). Only `ALLOWED_USER_ID` can press. No other messages: startup, errors and what a button did
+- `#ladder`: a pinned header on top listing the ladders ("משכפלים") with ➕ add / 🗑 delete, and under it one panel
+  per ladder (on/off, account picker, split/duplicate, BE, runner, SL-delete, settings incl. the per-account cap in
+  ounces). Each ladder has its own account, on/off and settings; an account used by one ladder is not offered to another. Only `ALLOWED_USER_ID` can press. No other messages: startup, errors and what a button did
   show as the panel's "last update" line, and each press gets a private confirmation that disappears.
-- `#ladder-log` (muted): every ladder / SL sync / BE / close message, through a webhook.
+- `#ladder-log` (muted): every ladder / SL sync / BE / close message, through a webhook, tagged with the ladder and account.
 - "Off" stops laddering new trades only; open groups keep their SL synced.
 
 ## Run it once
