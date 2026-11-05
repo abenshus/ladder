@@ -171,7 +171,7 @@ def panel_embed(engine, settings):
     embed.add_field(name="BE אחרי TP1", value=be, inline=True)
     embed.add_field(name="מחיקת SL", value="מוחקת מכולן" if p["sync_sl_delete"] else "מחזירה את ה-SL", inline=True)
     cap = p["max_total_lots"]
-    embed.add_field(name="הגבלת לוטים (לחשבון)", value=f"{cap:g} לוט ({cap * 100:g} אונקיות) לכל הסולם" if cap else "בלי הגבלה", inline=True)
+    embed.add_field(name="הגבלה (לחשבון)", value=f"{cap * 100:g} אונקיות ({cap:g} לוט) לכל הסולם" if cap else "בלי הגבלה", inline=True)
     groups = engine.open_groups()
     if groups:
         lines = [f"{g['side']} @{g['entry']} · {g['members']} עסקאות · SL {g['sl'] or '—'}"
@@ -195,9 +195,10 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
         self.copies = discord.ui.TextInput(label="כמה עסקאות בסך הכול (2-10)", default=str(p["copies"]), max_length=2)
         self.tp_step = discord.ui.TextInput(label="מרחק בין TP-ים בדולרים", default=str(p["tp_step"]), max_length=6)
         self.be_offset = discord.ui.TextInput(label="BE: כמה דולר מעבר לכניסה", default=str(p["be_offset"]), max_length=6)
-        self.max_lots = discord.ui.TextInput(label="מקסימום לוט לסולם (0.2 = 20 אונקיות, 0 = בלי)",
-                                             default=f"{p['max_total_lots']:g}", max_length=6)
-        for item in (self.copies, self.tp_step, self.be_offset, self.max_lots):
+        # in ounces: "20" is 20 oz (0.2 lot) - lots invited typing 20 for 20 oz
+        self.max_oz = discord.ui.TextInput(label="מקסימום אונקיות לכל הסולם (0 = בלי הגבלה)",
+                                           default=f"{p['max_total_lots'] * 100:g}", max_length=6)
+        for item in (self.copies, self.tp_step, self.be_offset, self.max_oz):
             self.add_item(item)
 
     async def on_submit(self, interaction):
@@ -205,12 +206,13 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
             copies = int(self.copies.value)
             tp_step = float(self.tp_step.value)
             be_offset = float(self.be_offset.value)
-            max_lots = round(float(self.max_lots.value), 2)
-            if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not 0 <= be_offset < tp_step or not 0 <= max_lots <= 5:
+            max_oz = float(self.max_oz.value)
+            max_lots = round(max_oz / 100, 2)
+            if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not 0 <= be_offset < tp_step or not 0 <= max_oz <= 500:
                 raise ValueError
         except ValueError:
             await interaction.response.send_message(
-                "ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100, BE offset בין 0 למרחק ה-TP, מקסימום לוט 0-5 (0.2 = 20 אונקיות).",
+                "ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100, BE offset בין 0 למרחק ה-TP, מקסימום אונקיות 0-500.",
                 ephemeral=True)
             return
         account = self.panel.settings.data["account"]
