@@ -522,7 +522,7 @@ class LadderManager:
 
     def _lot_line(self, qty, count, per, reduce, opened=None):
         done = f"{opened}/{count}" if opened is not None else f"{count}"
-        cap = f"  ({self._t('cap')} {self.p['max_total_lots']})" if self.p["max_total_lots"] else ""
+        cap = f"  ({self._t('cap')} {self.p['max_total_lots']:g} = {self.p['max_total_lots'] * 100:g} oz)" if self.p["max_total_lots"] else ""
         if reduce:
             return f"{self._t('qty')}: {qty} → {done} × {per}{cap}"
         if per == qty:
