@@ -156,34 +156,37 @@ def list_accounts():
 # Discord panel
 # ======================================================================
 def panel_embed(engine, settings):
+    """The panel as plain lines, one setting per line (inline fields read badly in Hebrew)."""
     p = engine.params
     on = p["enabled"]
     acc = settings.data["account"] or "—"
     note = account_notes().get(acc)
-    embed = discord.Embed(title=f"🪜 Ladder — {'🟢 פועל' if on else '🔴 כבוי'}",
-                          color=0x2ecc71 if on else 0xe74c3c)
-    embed.add_field(name="חשבון", value=f"{acc}" + (f"\n⚠️ {note}" if note else ""), inline=True)
-    embed.add_field(name="מצב", value="חלוקה (split)" if p["mode"] == "split" else "שכפול (duplicate)", inline=True)
-    embed.add_field(name="עסקאות", value=str(p["copies"]), inline=True)
-    embed.add_field(name="מרחק TP", value=f"{p['tp_step']}$", inline=True)
-    embed.add_field(name="Runner", value="כן" if p["runner_last"] else "לא", inline=True)
-    be = f"כן (+{p['be_offset']}$)" if p["be_after_tp1"] else "לא"
-    embed.add_field(name="BE אחרי TP1", value=be, inline=True)
-    embed.add_field(name="מחיקת SL", value="מוחקת מכולן" if p["sync_sl_delete"] else "מחזירה את ה-SL", inline=True)
     cap = p["max_total_lots"]
-    embed.add_field(name="הגבלה (לחשבון)", value=f"{cap * 100:g} אונקיות ({cap:g} לוט) לכל הסולם" if cap else "בלי הגבלה", inline=True)
+    lines = [
+        "🟢 **פועל** - משכפל עסקאות חדשות" if on else "🔴 **כבוי** - לא משכפל עסקאות חדשות (קבוצות פתוחות ממשיכות לקבל סנכרון SL)",
+        "",
+        f"**חשבון:** {acc}" + (f"  ⚠️ {note}" if note else ""),
+        f"**מצב:** {'חלוקה (split) - הלוט שלך מתחלק' if p['mode'] == 'split' else 'שכפול (duplicate) - כל עסקה בלוט שלך'}",
+        f"**עסקאות:** {p['copies']}",
+        f"**מרחק בין TP-ים:** {p['tp_step']:g}$",
+        f"**Runner (אחרונה בלי TP):** {'כן' if p['runner_last'] else 'לא'}",
+        f"**BE אחרי TP1:** " + (f"כן, כניסה +{p['be_offset']:g}$" if p["be_after_tp1"] else "לא"),
+        f"**מחיקת SL מעסקה:** {'מוחקת מכולן' if p['sync_sl_delete'] else 'מחזירה לה את ה-SL'}",
+        f"**הגבלה לחשבון:** " + (f"{cap * 100:g} אונקיות לכל הסולם" if cap else "בלי הגבלה"),
+        "",
+    ]
     groups = engine.open_groups()
     if groups:
-        lines = [f"{g['side']} @{g['entry']} · {g['members']} עסקאות · SL {g['sl'] or '—'}"
-                 + (" (ממתינה)" if g["kind"] == "pending" else "") for g in groups[:5]]
-        embed.add_field(name=f"קבוצות פתוחות ({len(groups)})", value="\n".join(lines), inline=False)
+        lines.append(f"**קבוצות פתוחות ({len(groups)}):**")
+        lines += [f"• {'קנייה' if g['side'] == 'buy' else 'מכירה'} @{g['entry']} · {g['members']} עסקאות · SL {g['sl'] or '—'}"
+                  + (" (פקודה ממתינה)" if g["kind"] == "pending" else "") for g in groups[:5]]
     else:
-        embed.add_field(name="קבוצות פתוחות", value="אין", inline=False)
+        lines.append("**קבוצות פתוחות:** אין")
+    embed = discord.Embed(title="🪜 Ladder", description="\n".join(lines), color=0x2ecc71 if on else 0xe74c3c)
     status = "מחובר" if engine.manager and engine.manager.summary else "מתחבר…"
     if engine.error:
         status = f"⚠️ {engine.error}"
-    embed.set_footer(text=f"{status} · עודכן {time.strftime('%H:%M:%S')}"
-                          + ("" if on else " · כבוי = לא משכפל עסקאות חדשות, קבוצות פתוחות ממשיכות לקבל סנכרון SL"))
+    embed.set_footer(text=f"{status} · עודכן {time.strftime('%H:%M:%S')}")
     return embed
 
 
