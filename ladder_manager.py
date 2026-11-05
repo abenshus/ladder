@@ -45,7 +45,7 @@ PARAMS = dict(
     enabled=True,               # False = לא משכפל עסקאות חדשות, אבל ממשיך לנהל SL של קבוצות פתוחות
     language="he",              # "he" / "en"
     symbol="XAUUSD",
-    mode="split",               # "duplicate" = כל עסקה בלוט שלך | "split" = הלוט שלך מתחלק ל-copies עסקאות
+    mode="duplicate",           # "duplicate" = כל עסקה בלוט שלך | "split" = הלוט שלך מתחלק ל-copies עסקאות
     copies=5,                   # כמה עסקאות בסך הכול (כולל שלך)
     max_total_lots=0.0,         # duplicate: כמה לוט מקסימום בכל הסולם (0 = בלי). אם עובר - העותקים קטנים כדי להישאר בפנים
     lot_step=0.01,              # split: הלוט הכי קטן; אם אין מספיק ל-copies - פחות עסקאות, השארית אצלך
