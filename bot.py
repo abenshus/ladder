@@ -105,6 +105,13 @@ class Engine:
                 self.manager = lm.LadderManager(self.params, state_file, account_id=account, stop_event=stop)
                 self.error = ""
                 self.manager.run()
+            except RuntimeError as exc:
+                if "already running" not in str(exc):
+                    self.error = str(exc)[:200]
+                    log.exception(f"ladder manager for {account} crashed - restarting in 15s")
+                else:
+                    # a deploy starts the new container before the old one lets go of the account: wait for it
+                    log.info(f"previous ladder manager for {account} still holds the account - retrying in 15s")
             except Exception as exc:
                 self.error = str(exc)[:200]
                 log.exception(f"ladder manager for {account} crashed - restarting in 15s")
