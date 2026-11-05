@@ -32,7 +32,7 @@ ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 
 # what the panel may change; everything else stays as in lm.PARAMS
-EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_offset", "sync_sl_delete")
+EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "sync_sl_delete")
 
 
 def account_notes():
@@ -188,7 +188,9 @@ def panel_embed(engine, settings):
         f"**עסקאות:** {p['copies']}",
         f"**מרחק בין TP-ים:** {p['tp_step']:g}$",
         f"**Runner (אחרונה בלי TP):** {'כן' if p['runner_last'] else 'לא'}",
-        f"**BE אחרי TP1:** " + (f"כן, כניסה +{p['be_offset']:g}$" if p["be_after_tp1"] else "לא"),
+        "**אחרי TP1:** " + ("ה-SL של השאר עובר ל-TP1 (נועל את רווח TP1)" if p["be_after_tp1"] and p["be_to"] == "tp1"
+                            else f"ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$" if p["be_after_tp1"]
+                            else "ה-SL לא זז"),
         f"**מחיקת SL מעסקה:** {'מוחקת מכולן' if p['sync_sl_delete'] else 'מחזירה לה את ה-SL'}",
         f"**הגבלה לחשבון:** " + (f"{cap * 100:g} אונקיות לכל הסולם" if cap else "בלי הגבלה"),
         "",
@@ -217,7 +219,7 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
         p = panel.engine.params
         self.copies = discord.ui.TextInput(label="כמה עסקאות בסך הכול (2-10)", default=str(p["copies"]), max_length=2)
         self.tp_step = discord.ui.TextInput(label="מרחק בין TP-ים בדולרים", default=str(p["tp_step"]), max_length=6)
-        self.be_offset = discord.ui.TextInput(label="BE: כמה דולר מעבר לכניסה", default=str(p["be_offset"]), max_length=6)
+        self.be_offset = discord.ui.TextInput(label="SL לכניסה: כמה דולר מעבר לכניסה", default=str(p["be_offset"]), max_length=6)
         # in ounces: "20" is 20 oz (0.2 lot) - lots invited typing 20 for 20 oz
         self.max_oz = discord.ui.TextInput(label="מקסימום אונקיות לכל הסולם (0 = בלי הגבלה)",
                                            default=f"{p['max_total_lots'] * 100:g}", max_length=6)
@@ -337,10 +339,18 @@ class Panel(discord.ui.View):
         new = "duplicate" if self.engine.params["mode"] == "split" else "split"
         await self._toggle(interaction, "mode", new, "✂️ מצב: " + ("שכפול" if new == "duplicate" else "חלוקה"))
 
-    @discord.ui.button(label="BE אחרי TP1", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
+    @discord.ui.button(label="SL אחרי TP1", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
     async def be(self, interaction, button):
-        new = not self.engine.params["be_after_tp1"]
-        await self._toggle(interaction, "be_after_tp1", new, "🔒 BE אחרי TP1: " + ("פועל" if new else "כבוי"))
+        # cycles: off -> to TP1 -> to entry -> off
+        p = self.engine.params
+        if not p["be_after_tp1"]:
+            self.engine.set("be_to", "tp1")
+            await self._toggle(interaction, "be_after_tp1", True, "🔒 אחרי TP1: ה-SL של השאר עובר ל-TP1")
+        elif p["be_to"] == "tp1":
+            await self._toggle(interaction, "be_to", "entry",
+                               f"🔒 אחרי TP1: ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$")
+        else:
+            await self._toggle(interaction, "be_after_tp1", False, "🔒 אחרי TP1: ה-SL לא זז")
 
     @discord.ui.button(label="Runner", emoji="🏃", style=discord.ButtonStyle.primary, custom_id="ladder:runner", row=1)
     async def runner(self, interaction, button):

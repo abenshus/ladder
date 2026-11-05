@@ -13,7 +13,8 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
 2. פקודת Limit/Stop ידנית חדשה -> מוסיף copies-1 פקודות באותו מחיר עם TP מדורג.
    הזזת המחיר של הפקודה שלך מזיזה את כולן (כולל ה-TP), ביטול מבטל את כולן.
 3. סנכרון סטופ: הזזת SL באחת מעסקאות הקבוצה -> אותו SL לכל השאר.
-4. be_after_tp1=True -> כשעסקה ראשונה בקבוצה נסגרת (TP1) הסטופ של השאר עובר לכניסה (+be_offset).
+4. be_after_tp1=True -> כשעסקה ראשונה בקבוצה נסגרת (TP1) הסטופ של השאר עובר ל-TP1 (be_to="tp1", נועל את רווח TP1)
+   או לכניסה + be_offset (be_to="entry").
 
 עסקאות של בוטים אחרים (strategyId לא ריק, למשל HGUARD) לא נוגעים בהן.
 עסקאות שהיו פתוחות כשהשירות עלה - לא משוכפלות.
@@ -53,8 +54,9 @@ PARAMS = dict(
     runner_last=True,           # העסקה האחרונה בלי TP
     sync_sl=True,               # הזזת SL באחת -> לכולן
     sync_sl_delete=True,        # מחיקת SL מאחת -> נמחק מכולן (False = מחזירים לה את ה-SL של הקבוצה)
-    be_after_tp1=False,         # אחרי TP1 - SL של השאר לכניסה
-    be_offset=0.0,              # כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
+    be_after_tp1=False,         # אחרי TP1 - SL של השאר זז (לאן: be_to)
+    be_to="tp1",                # "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset
+    be_offset=0.0,              # be_to="entry": כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
     handle_pending=True,        # לשכפל גם פקודות Limit/Stop
     use_stream=True,            # Streams API (צריך TL_DEV_KEY); False = polling
     stream_url="https://api.tradelocker.com",
@@ -76,7 +78,7 @@ TRANSLATIONS = {
         "pending_filled": "✅ <b>פקודה התמלאה</b>",
         "sl_sync": "🛡 <b>סטופ סונכרן</b>",
         "sl_cleared": "🚫 <b>סטופ נמחק מכל העסקאות</b>",
-        "be": "🔒 <b>TP1 נתפס - סטופ לכניסה</b>",
+        "be": "🔒 <b>TP1 נתפס - סטופ הוזז</b>",
         "group_done": "🏁 <b>הקבוצה נסגרה</b>",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
@@ -91,7 +93,7 @@ TRANSLATIONS = {
         "pending_filled": "✅ <b>Order filled</b>",
         "sl_sync": "🛡 <b>Stop synced</b>",
         "sl_cleared": "🚫 <b>Stop removed from all trades</b>",
-        "be": "🔒 <b>TP1 hit - stop to entry</b>",
+        "be": "🔒 <b>TP1 hit - stop moved</b>",
         "group_done": "🏁 <b>Group closed</b>",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
@@ -563,6 +565,7 @@ class LadderManager:
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
             "target_sl": pos["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_done": False,
+            "tp1": levels[0],
         }
         self._broadcast(self._t("ladder"), [
             f"{self._t('side')}: {pos['side']}  {self._lot_line(pos['qty'], count, per, reduce, opened)}",
@@ -675,15 +678,18 @@ class LadderManager:
             attempts = attempts + 1 if self._same(sent_target, target) else 0
         else:
             attempts = 0
-        if target is None:
-            ok = self._protect(member, None, member["tp"])    # PATCH without stopLoss removes it
-            via = "clear"
-        elif attempts % 2 == 1 and member["sl_id"] != "0":
-            ok = self._modify_order(member["sl_id"], {"stopPrice": target})
-            via = "order"
-        else:
-            ok = self._protect(member, target, member["tp"])
-            via = "position"
+        try:
+            if target is None:
+                ok = self._protect(member, None, member["tp"])    # PATCH without stopLoss removes it
+                via = "clear"
+            elif attempts % 2 == 1 and member["sl_id"] != "0":
+                ok = self._modify_order(member["sl_id"], {"stopPrice": target})
+                via = "order"
+            else:
+                ok = self._protect(member, target, member["tp"])
+                via = "position"
+        except Exception as exc:    # e.g. the server refuses an SL the price already passed - retried next round
+            ok, via = f"refused: {str(exc)[:120]}", "error"
         log.info(f"set SL {pid} -> {target} via {via} ok={ok} attempt={attempts}")
         self.sl_pending[pid] = (target, now, attempts)
 
@@ -737,7 +743,11 @@ class LadderManager:
             if self.p["be_after_tp1"] and not g["be_done"] and len(members) < g["max_members"] \
                     and g["max_members"] >= 2:
                 sign = 1 if g["side"] == "buy" else -1
-                be = self._round(g["entry"] + sign * self.p["be_offset"])
+                if self.p["be_to"] == "tp1":
+                    # TP1 as it was set when the ladder opened (tp_step may have changed since)
+                    be = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * self.p["tp_step"])
+                else:
+                    be = self._round(g["entry"] + sign * self.p["be_offset"])
                 better = g["target_sl"] is None or (be - g["target_sl"]) * sign > 0
                 g["be_done"] = True
                 if better:
