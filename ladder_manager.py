@@ -22,7 +22,7 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
 active=False: רק מדפיס מה היה עושה, בלי לשלוח פקודות.
 
 Secrets/connection come from env vars: TL_ENV, TL_SERVER, TL_EMAIL, TL_PASSWORD,
-TL_ACCOUNT_ID, TL_DEV_KEY (Streams), DISCORD_WEBHOOK (log channel), DISCORD_WEBHOOK_ALERT (control channel), STATE_FILE.
+TL_ACCOUNT_ID, TL_DEV_KEY (Streams), DISCORD_WEBHOOK (log channel), DISCORD_WEBHOOK_ALERT (control channel, CLI only - the panel shows alerts itself), STATE_FILE.
 """
 import argparse
 import fcntl
@@ -273,10 +273,14 @@ class LadderManager:
         if not self.p["active"]:
             text += "\n" + self._t("dry")
         log.info(text.replace("<b>", "").replace("</b>", ""))
-        # everything goes to the (muted) log channel; errors and startup also to the control channel
+        # everything goes to the (muted) log channel; errors and startup also to the control channel -
+        # under the Discord panel (on_alert) as its "last update" line instead of a new message
         urls = [os.environ.get("DISCORD_WEBHOOK", "")]
         if header in (self._t("error"), self._t("start")):
-            urls.append(os.environ.get("DISCORD_WEBHOOK_ALERT", ""))
+            if self.on_alert:
+                self.on_alert(header.replace("<b>", "").replace("</b>", ""), lines)
+            else:
+                urls.append(os.environ.get("DISCORD_WEBHOOK_ALERT", ""))
         for url in urls:
             if not url:
                 continue
@@ -806,6 +810,7 @@ class LadderManager:
         }
 
     summary = None      # last tick's view, read by the Discord panel
+    on_alert = None     # set by the Discord panel: (header, lines) of errors / startup
 
     def _single_instance(self):
         """Two managers on one account would ladder every trade twice - refuse to start a second one."""

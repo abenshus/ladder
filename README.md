@@ -24,7 +24,8 @@ Live data comes from the TradeLocker **Streams API** (developer key), orders go 
 ## Discord
 
 - `#ladder`: one panel message (on/off, account picker, split/duplicate, BE, runner, SL-delete, settings incl. the
-  per-account lot cap). Only `ALLOWED_USER_ID` can press. Errors and startup land here too.
+  per-account cap in ounces). Only `ALLOWED_USER_ID` can press. No other messages: startup, errors and what a button did
+  show as the panel's "last update" line, and each press gets a private confirmation that disappears.
 - `#ladder-log` (muted): every ladder / SL sync / BE / close message, through a webhook.
 - "Off" stops laddering new trades only; open groups keep their SL synced.
 

@@ -81,6 +81,16 @@ class Engine:
         self.stop = None
         self.thread = None
         self.error = ""
+        self.last = ""      # the panel's "last update" line: startup, errors, what a button did
+
+    def note(self, text):
+        self.last = f"{text} · {time.strftime('%H:%M:%S')}"
+
+    def _alert(self, header, lines):
+        if header.startswith("🚀"):
+            self.note("🚀 השרת מחובר לחשבון ומנהל אותו")
+        else:
+            self.note(f"{header}: {' · '.join(lines)[:300]}")
 
     def start(self, account):
         self.stop_engine()
@@ -103,6 +113,7 @@ class Engine:
         while not stop.is_set():
             try:
                 self.manager = lm.LadderManager(self.params, state_file, account_id=account, stop_event=stop)
+                self.manager.on_alert = self._alert
                 self.error = ""
                 self.manager.run()
             except RuntimeError as exc:
@@ -189,6 +200,8 @@ def panel_embed(engine, settings):
                   + (" (פקודה ממתינה)" if g["kind"] == "pending" else "") for g in groups[:5]]
     else:
         lines.append("**קבוצות פתוחות:** אין")
+    if engine.last:
+        lines += ["", f"**עדכון אחרון:** {engine.last}"]
     embed = discord.Embed(title="🪜 Ladder", description="\n".join(lines), color=0x2ecc71 if on else 0xe74c3c)
     status = "מחובר" if engine.manager and engine.manager.summary else "מתחבר…"
     if engine.error:
@@ -231,8 +244,8 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
         self.panel.engine.set("copies", copies)
         self.panel.engine.set("tp_step", tp_step)
         self.panel.engine.set("be_offset", be_offset)
-        await interaction.response.defer()
-        await self.panel.refresh()
+        cap = f"{max_oz:g} אונקיות" if max_lots else "בלי"
+        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · BE +{be_offset:g}$ · הגבלה {cap}")
 
 
 class ConfirmSwitch(discord.ui.View):
@@ -245,6 +258,7 @@ class ConfirmSwitch(discord.ui.View):
     async def yes(self, interaction, button):
         await interaction.response.edit_message(content=f"מחליף לחשבון {self.account}…", view=None)
         await self.panel.switch(self.account)
+        await interaction.edit_original_response(content=f"✅ השרת עבר לחשבון {self.account}")
 
     @discord.ui.button(label="ביטול", style=discord.ButtonStyle.secondary)
     async def no(self, interaction, button):
@@ -270,8 +284,9 @@ class AccountSelect(discord.ui.Select):
                 f"יש {len(groups)} קבוצות פתוחות בחשבון הנוכחי. אחרי ההחלפה ה-SL שלהן לא יסונכרן יותר. להחליף בכל זאת?",
                 view=ConfirmSwitch(self.panel, account), ephemeral=True)
             return
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.panel.switch(account)
+        await interaction.followup.send(f"✅ השרת עבר לחשבון {account}", ephemeral=True)
 
 
 class Panel(discord.ui.View):
@@ -289,18 +304,23 @@ class Panel(discord.ui.View):
             return False
         return True
 
-    async def _toggle(self, interaction, key, value):
+    async def _toggle(self, interaction, key, value, text):
         self.engine.set(key, value)
-        await interaction.response.defer()
+        await self.confirm(interaction, text)
+
+    async def confirm(self, interaction, text):
+        """The change is already applied on the server: say so to the user only, and in the panel's last line."""
+        self.engine.note(text + " (השרת אישר)")
+        await interaction.response.send_message(text, ephemeral=True, delete_after=15)
         await self.refresh()
 
     @discord.ui.button(label="הדלק", emoji="🟢", style=discord.ButtonStyle.success, custom_id="ladder:on", row=0)
     async def on(self, interaction, button):
-        await self._toggle(interaction, "enabled", True)
+        await self._toggle(interaction, "enabled", True, "🟢 הופעל - משכפל עסקאות חדשות")
 
     @discord.ui.button(label="כבה", emoji="🔴", style=discord.ButtonStyle.danger, custom_id="ladder:off", row=0)
     async def off(self, interaction, button):
-        await self._toggle(interaction, "enabled", False)
+        await self._toggle(interaction, "enabled", False, "🔴 כובה - לא משכפל עסקאות חדשות")
 
     @discord.ui.button(label="הגדרות", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="ladder:settings", row=0)
     async def settings_button(self, interaction, button):
@@ -314,24 +334,30 @@ class Panel(discord.ui.View):
 
     @discord.ui.button(label="חלוקה / שכפול", emoji="✂️", style=discord.ButtonStyle.primary, custom_id="ladder:mode", row=1)
     async def mode(self, interaction, button):
-        await self._toggle(interaction, "mode", "duplicate" if self.engine.params["mode"] == "split" else "split")
+        new = "duplicate" if self.engine.params["mode"] == "split" else "split"
+        await self._toggle(interaction, "mode", new, "✂️ מצב: " + ("שכפול" if new == "duplicate" else "חלוקה"))
 
     @discord.ui.button(label="BE אחרי TP1", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
     async def be(self, interaction, button):
-        await self._toggle(interaction, "be_after_tp1", not self.engine.params["be_after_tp1"])
+        new = not self.engine.params["be_after_tp1"]
+        await self._toggle(interaction, "be_after_tp1", new, "🔒 BE אחרי TP1: " + ("פועל" if new else "כבוי"))
 
     @discord.ui.button(label="Runner", emoji="🏃", style=discord.ButtonStyle.primary, custom_id="ladder:runner", row=1)
     async def runner(self, interaction, button):
-        await self._toggle(interaction, "runner_last", not self.engine.params["runner_last"])
+        new = not self.engine.params["runner_last"]
+        await self._toggle(interaction, "runner_last", new, "🏃 Runner: " + ("כן" if new else "לא"))
 
     @discord.ui.button(label="מחיקת SL", emoji="🚫", style=discord.ButtonStyle.primary, custom_id="ladder:sldel", row=1)
     async def sldel(self, interaction, button):
-        await self._toggle(interaction, "sync_sl_delete", not self.engine.params["sync_sl_delete"])
+        new = not self.engine.params["sync_sl_delete"]
+        await self._toggle(interaction, "sync_sl_delete", new,
+                           "🚫 מחיקת SL: " + ("מוחקת מכולן" if new else "מחזירה את ה-SL"))
 
     async def switch(self, account):
         self.settings.data["account"] = account
         self.settings.save()
         await asyncio.to_thread(self.engine.start, account)
+        self.engine.note(f"🔁 עבר לחשבון {account}")
         await self.refresh()
 
     async def refresh(self):
@@ -388,7 +414,7 @@ class LadderBot(discord.Client):
         while not self.is_closed():
             await asyncio.sleep(10)
             # edit only when something visible changed (Discord rate-limits edits)
-            key = json.dumps([self.engine.open_groups(), self.engine.error, self.engine.manager is not None
+            key = json.dumps([self.engine.open_groups(), self.engine.error, self.engine.last, self.engine.manager is not None
                               and self.engine.manager.summary is not None], default=str)
             if key != last:
                 last = key
