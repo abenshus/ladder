@@ -32,7 +32,8 @@ ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 
 # what the panel may change; everything else stays as in lm.PARAMS
-EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "sync_sl_delete")
+EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "lock_tp1_at",
+            "sync_sl_delete")
 
 
 def logins():
@@ -197,6 +198,17 @@ def list_accounts():
 # ======================================================================
 # Discord panel
 # ======================================================================
+def after_tp1_text(p):
+    if not p["be_after_tp1"]:
+        return "ה-SL לא זז"
+    if p["be_to"] == "two_step":
+        where = "TP2" if p["lock_tp1_at"] >= 1 else f"{p['lock_tp1_at'] * 100:g}% מהדרך ל-TP2"
+        return f"ה-SL של השאר לכניסה +{p['be_offset']:g}$, וכשהמחיר מגיע ל-{where} - ל-TP1"
+    if p["be_to"] == "tp1":
+        return "ה-SL של השאר עובר ל-TP1 (נועל את רווח TP1)"
+    return f"ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$"
+
+
 def panel_embed(engine, settings):
     """The panel as plain lines, one setting per line (inline fields read badly in Hebrew)."""
     p = engine.params
@@ -213,9 +225,7 @@ def panel_embed(engine, settings):
         f"**עסקאות:** {p['copies']}",
         f"**מרחק בין TP-ים:** {p['tp_step']:g}$",
         f"**Runner (אחרונה בלי TP):** {'כן' if p['runner_last'] else 'לא'}",
-        "**אחרי TP1:** " + ("ה-SL של השאר עובר ל-TP1 (נועל את רווח TP1)" if p["be_after_tp1"] and p["be_to"] == "tp1"
-                            else f"ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$" if p["be_after_tp1"]
-                            else "ה-SL לא זז"),
+        "**אחרי TP1:** " + after_tp1_text(p),
         f"**מחיקת SL מעסקה:** {'מוחקת מכולן' if p['sync_sl_delete'] else 'מחזירה לה את ה-SL'}",
         f"**הגבלה לחשבון:** " + (f"{cap * 100:g} אונקיות לכל הסולם" if cap else "בלי הגבלה"),
         "",
@@ -248,7 +258,9 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
         # in ounces: "20" is 20 oz (0.2 lot) - lots invited typing 20 for 20 oz
         self.max_oz = discord.ui.TextInput(label="מקסימום אונקיות לכל הסולם (0 = בלי הגבלה)",
                                            default=f"{p['max_total_lots'] * 100:g}", max_length=6)
-        for item in (self.copies, self.tp_step, self.be_offset, self.max_oz):
+        self.lock_at = discord.ui.TextInput(label="SL ל-TP1 אחרי חלק מהדרך ל-TP2 (0.5 / 1)",
+                                            default=f"{p['lock_tp1_at']:g}", max_length=4)
+        for item in (self.copies, self.tp_step, self.be_offset, self.lock_at, self.max_oz):
             self.add_item(item)
 
     async def on_submit(self, interaction):
@@ -257,12 +269,14 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
             tp_step = float(self.tp_step.value)
             be_offset = float(self.be_offset.value)
             max_oz = float(self.max_oz.value)
+            lock_at = float(self.lock_at.value)
             max_lots = round(max_oz / 100, 2)
-            if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not 0 <= be_offset < tp_step or not 0 <= max_oz <= 500:
+            if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not 0 <= be_offset < tp_step or not 0 <= max_oz <= 500 \
+                    or not 0 < lock_at <= 1:
                 raise ValueError
         except ValueError:
             await interaction.response.send_message(
-                "ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100, BE offset בין 0 למרחק ה-TP, מקסימום אונקיות 0-500.",
+                "ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100, BE offset בין 0 למרחק ה-TP, נעילת TP1 בין 0 ל-1, מקסימום אונקיות 0-500.",
                 ephemeral=True)
             return
         account = self.panel.settings.data["account"]
@@ -271,8 +285,10 @@ class SettingsModal(discord.ui.Modal, title="הגדרות Ladder"):
         self.panel.engine.set("copies", copies)
         self.panel.engine.set("tp_step", tp_step)
         self.panel.engine.set("be_offset", be_offset)
+        self.panel.engine.set("lock_tp1_at", lock_at)
         cap = f"{max_oz:g} אונקיות" if max_lots else "בלי"
-        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · BE +{be_offset:g}$ · הגבלה {cap}")
+        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · BE +{be_offset:g}$ · "
+                                         f"TP1 אחרי {lock_at:g} · הגבלה {cap}")
 
 
 class ConfirmSwitch(discord.ui.View):
@@ -375,16 +391,18 @@ class Panel(discord.ui.View):
 
     @discord.ui.button(label="SL אחרי TP1", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
     async def be(self, interaction, button):
-        # cycles: off -> to TP1 -> to entry -> off
+        # cycles: off -> two steps (entry, then TP1) -> TP1 at once -> entry only -> off
         p = self.engine.params
         if not p["be_after_tp1"]:
+            self.engine.set("be_to", "two_step")
+            self.engine.set("be_after_tp1", True)
+        elif p["be_to"] == "two_step":
             self.engine.set("be_to", "tp1")
-            await self._toggle(interaction, "be_after_tp1", True, "🔒 אחרי TP1: ה-SL של השאר עובר ל-TP1")
         elif p["be_to"] == "tp1":
-            await self._toggle(interaction, "be_to", "entry",
-                               f"🔒 אחרי TP1: ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$")
+            self.engine.set("be_to", "entry")
         else:
-            await self._toggle(interaction, "be_after_tp1", False, "🔒 אחרי TP1: ה-SL לא זז")
+            self.engine.set("be_after_tp1", False)
+        await self.confirm(interaction, "🔒 אחרי TP1: " + after_tp1_text(p))
 
     @discord.ui.button(label="Runner", emoji="🏃", style=discord.ButtonStyle.primary, custom_id="ladder:runner", row=1)
     async def runner(self, interaction, button):

@@ -13,8 +13,11 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
 2. פקודת Limit/Stop ידנית חדשה -> מוסיף copies-1 פקודות באותו מחיר עם TP מדורג.
    הזזת המחיר של הפקודה שלך מזיזה את כולן (כולל ה-TP), ביטול מבטל את כולן.
 3. סנכרון סטופ: הזזת SL באחת מעסקאות הקבוצה -> אותו SL לכל השאר.
-4. be_after_tp1=True -> כשעסקה ראשונה בקבוצה נסגרת (TP1) הסטופ של השאר עובר ל-TP1 (be_to="tp1", נועל את רווח TP1)
-   או לכניסה + be_offset (be_to="entry").
+4. be_after_tp1=True -> הסטופ של השאר זז אחרי TP1. be_to:
+   "two_step" (ברירת מחדל): TP1 נתפס -> SL לכניסה + be_offset; המחיר הגיע ל-lock_tp1_at מהדרך TP1→TP2
+              (0.5 = חצי הדרך, 1 = TP2) או ש-TP2 נתפס -> SL ל-TP1.
+   "tp1": SL ל-TP1 מיד כש-TP1 נתפס.  "entry": SL לכניסה + be_offset.
+   המחיר הנוכחי מגיע מה-PnL של העסקאות ב-stream (כל ~2 שניות); ב-polling שלב 2 רק כש-TP2 נתפס.
 
 עסקאות של בוטים אחרים (strategyId לא ריק, למשל HGUARD) לא נוגעים בהן.
 עסקאות שהיו פתוחות כשהשירות עלה - לא משוכפלות.
@@ -55,8 +58,9 @@ PARAMS = dict(
     sync_sl=True,               # הזזת SL באחת -> לכולן
     sync_sl_delete=True,        # מחיקת SL מאחת -> נמחק מכולן (False = מחזירים לה את ה-SL של הקבוצה)
     be_after_tp1=False,         # אחרי TP1 - SL של השאר זז (לאן: be_to)
-    be_to="tp1",                # "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset
-    be_offset=0.0,              # be_to="entry": כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
+    be_to="two_step",           # "two_step" = כניסה ואז TP1 | "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset
+    be_offset=0.0,              # SL לכניסה: כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
+    lock_tp1_at=0.5,            # two_step: SL ל-TP1 כשהמחיר עבר את החלק הזה מהדרך TP1→TP2 (0.5 = חצי, 1 = TP2)
     handle_pending=True,        # לשכפל גם פקודות Limit/Stop
     use_stream=True,            # Streams API (צריך TL_DEV_KEY); False = polling
     stream_url="https://api.tradelocker.com",
@@ -79,6 +83,7 @@ TRANSLATIONS = {
         "sl_sync": "🛡 <b>סטופ סונכרן</b>",
         "sl_cleared": "🚫 <b>סטופ נמחק מכל העסקאות</b>",
         "be": "🔒 <b>TP1 נתפס - סטופ הוזז</b>",
+        "lock_tp1": "🔐 <b>המחיר המשיך - סטופ ל-TP1</b>",
         "group_done": "🏁 <b>הקבוצה נסגרה</b>",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
@@ -94,6 +99,7 @@ TRANSLATIONS = {
         "sl_sync": "🛡 <b>Stop synced</b>",
         "sl_cleared": "🚫 <b>Stop removed from all trades</b>",
         "be": "🔒 <b>TP1 hit - stop moved</b>",
+        "lock_tp1": "🔐 <b>Price ran on - stop to TP1</b>",
         "group_done": "🏁 <b>Group closed</b>",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
@@ -134,6 +140,7 @@ class StreamFeed:
         self.orders = {}        # oid -> merged OpenOrder events (modify events omit status)
         self.origin = {}        # pid -> order id that opened it
         self.filled = {}        # entry order id -> position id
+        self.pnl = {}           # pid -> open PnL in USD (AccountStatus.positionPnLs)
 
     @property
     def alive(self):
@@ -187,6 +194,8 @@ class StreamFeed:
         with self.lock:
             if kind == "Property" and m.get("name") == "SyncEnd":
                 self.synced = True
+            elif kind == "AccountStatus":
+                self.pnl = {x["positionId"]: x["pnl"] for x in m.get("positionPnLs") or []}
             elif kind == "Position" and m.get("instrument") == self.symbol:
                 pid = m["positionId"]
                 self.positions[pid] = m
@@ -235,11 +244,16 @@ class StreamFeed:
                 }
             positions = {}
             for pid, p in self.positions.items():
+                units = num(p.get("units"))
+                sign = 1 if p["side"].lower() == "buy" else -1
                 positions[pid] = {
                     "id": pid, "side": p["side"].lower(), "qty": num(p.get("lots")),
                     "price": num(p.get("openPrice")),
                     "sl_id": p.get("stopLossOrderId", "0"), "tp_id": p.get("takeProfitOrderId", "0"),
                     "origin": self.origin.get(pid),
+                    # price this position would close at now (bid for a buy, ask for a sell)
+                    "mark": num(p.get("openPrice")) + sign * float(self.pnl[pid]) / units
+                            if pid in self.pnl and units else None,
                 }
             return positions, orders
 
@@ -447,7 +461,7 @@ class LadderManager:
             positions[str(r["id"])] = {
                 "id": str(r["id"]), "side": r["side"], "qty": float(r["qty"]),
                 "price": float(r["avgPrice"]), "sl_id": str(int(r["stopLossId"])),
-                "tp_id": str(int(r["takeProfitId"])), "strategy": r["strategyId"],
+                "tp_id": str(int(r["takeProfitId"])), "strategy": r["strategyId"], "mark": None,
             }
         orders = {}
         for r in ord_df.to_dict("records"):
@@ -572,8 +586,8 @@ class LadderManager:
             self._broadcast(self._t("error"), errors[:1])
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
-            "target_sl": pos["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_done": False,
-            "tp1": levels[0],
+            "target_sl": pos["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
+            "tp1": levels[0], "step": self.p["tp_step"],
         }
         self._broadcast(self._t("ladder"), [
             f"{self._t('side')}: {pos['side']}  {self._lot_line(pos['qty'], count, per, reduce, opened)}",
@@ -587,7 +601,7 @@ class LadderManager:
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
             "target_sl": pos["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0,
-            "be_done": False, "adopted": True,
+            "be_stage": 0, "adopted": True,
         }
 
     def _ladder_pending(self, order):
@@ -622,7 +636,7 @@ class LadderManager:
             "kind": "pending", "side": order["side"], "entry": entry, "parent_order": order["id"],
             "type": order["type"],
             "target_sl": (order["sl"] or None) if self.p["sync_sl"] else None, "seen_sl": {},
-            "max_members": 0, "be_done": False,
+            "max_members": 0, "be_stage": 0, "step": self.p["tp_step"],
         }
         self._broadcast(self._t("ladder_pending"), [
             f"{order['type']} {order['side']}  {self._lot_line(order['qty'], count, per, reduce)}",
@@ -701,6 +715,36 @@ class LadderManager:
         log.info(f"set SL {pid} -> {target} via {via} ok={ok} attempt={attempts}")
         self.sl_pending[pid] = (target, now, attempts)
 
+    def _move_after_tp1(self, g, members, clear):
+        """SL of the rest after TP1 (see be_to). Returns the group's clear flag."""
+        stage = g["be_stage"] if "be_stage" in g else (2 if "be_done" in g and g["be_done"] else 0)
+        hits = g["max_members"] - len(members)
+        if hits < 1 or stage == 2:
+            return clear
+        sign = 1 if g["side"] == "buy" else -1
+        step = g["step"] if "step" in g else self.p["tp_step"]
+        # the TP1 the ladder opened with; a filled pending group's entry is the fill price
+        tp1 = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * step)
+        entry_sl = self._round(g["entry"] + sign * self.p["be_offset"])
+        header, be = None, None
+        if self.p["be_to"] == "two_step":
+            trigger = tp1 + sign * step * self.p["lock_tp1_at"]
+            marks = [m["mark"] for m in members if m["mark"] is not None]
+            ran_on = bool(marks) and (marks[0] - trigger) * sign >= 0
+            if hits >= 2 or ran_on:
+                header, be, stage = "lock_tp1", tp1, 2
+            elif stage == 0:
+                header, be, stage = "be", entry_sl, 1
+        else:
+            header, be, stage = "be", tp1 if self.p["be_to"] == "tp1" else entry_sl, 2
+        g["be_stage"] = stage
+        if be is None or not (g["target_sl"] is None or (be - g["target_sl"]) * sign > 0):
+            return clear
+        g["target_sl"] = be
+        g["clear_sl"] = False
+        self._broadcast(self._t(header), [f"{self._t('sl')}: {be}"])
+        return False
+
     def _handle_open_groups(self, positions):
         now = time.time()
         for tag, g in list(self.state["groups"].items()):
@@ -748,20 +792,8 @@ class LadderManager:
                     g["clear_sl"] = clear = True
                     self._broadcast(self._t("sl_cleared"), [f"{self._t('count')}: {len(members)}"])
 
-            if self.p["be_after_tp1"] and not g["be_done"] and len(members) < g["max_members"] \
-                    and g["max_members"] >= 2:
-                sign = 1 if g["side"] == "buy" else -1
-                if self.p["be_to"] == "tp1":
-                    # TP1 as it was set when the ladder opened (tp_step may have changed since)
-                    be = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * self.p["tp_step"])
-                else:
-                    be = self._round(g["entry"] + sign * self.p["be_offset"])
-                better = g["target_sl"] is None or (be - g["target_sl"]) * sign > 0
-                g["be_done"] = True
-                if better:
-                    g["target_sl"] = be
-                    g["clear_sl"] = clear = False
-                    self._broadcast(self._t("be"), [f"{self._t('sl')}: {be}"])
+            if self.p["be_after_tp1"] and g["max_members"] >= 2:
+                clear = self._move_after_tp1(g, members, clear)
 
             if g["target_sl"] is not None or clear:
                 calls = []

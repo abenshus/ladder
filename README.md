@@ -7,7 +7,7 @@ Turns one manual TradeLocker trade into a ladder of trades with stepped take-pro
   so the whole ladder stays under the cap.
 - TPs every `tp_step` dollars, the last trade without a TP (runner) unless turned off.
 - Move the SL of any trade → all get it within ~2s. Delete it → removed from all (or restored, `sync_sl_delete=False`).
-- Optional SL move after TP1 (`be_after_tp1`): to TP1 (`be_to="tp1"`, locks TP1's profit) or to entry + `be_offset`.
+- Optional SL move after TP1 (`be_after_tp1`). `be_to="two_step"` (default): TP1 hit → SL to entry + `be_offset`; price gets `lock_tp1_at` of the way to TP2 (0.5 = halfway, 1 = TP2) or TP2 hits → SL to TP1. The price comes from the positions' PnL in the stream (~2s). `be_to="tp1"`: SL to TP1 at once. `be_to="entry"`: entry + `be_offset` only.
 - Pending limit/stop orders are laddered too; moving or cancelling yours moves or cancels the copies.
 - Trades of other bots (any strategyId) are left alone. Copies are tagged `LAD-<parent position>`.
 
