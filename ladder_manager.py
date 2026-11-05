@@ -572,7 +572,7 @@ class LadderManager:
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
             "target_sl": pos["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0,
-            "be_done": False,
+            "be_done": False, "adopted": True,
         }
 
     def _ladder_pending(self, order):
@@ -698,6 +698,15 @@ class LadderManager:
                 self._broadcast(self._t("group_done"), [tag])
                 continue
             g["max_members"] = max(g["max_members"], len(members))
+            if "adopted" in g:
+                # taken over from an earlier run (restart, other machine): an SL set while nobody was managing the
+                # group counts as the user's - the most common one among the trades goes to all of them
+                del g["adopted"]
+                sls = [m["sl"] for m in members if m["sl"] is not None]
+                if self.p["sync_sl"] and g["target_sl"] is None and sls:
+                    g["target_sl"] = max(set(sls), key=sls.count)
+                    self._broadcast(self._t("sl_sync"), [f"{self._t('sl')}: {g['target_sl']}",
+                                                         f"{self._t('count')}: {len(members)}"])
 
             clear = "clear_sl" in g and g["clear_sl"]
             if self.p["sync_sl"]:
