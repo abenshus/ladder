@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+data/
+state*.json
+state*.json.tmp
+state*.json.lock
+settings.json
+settings.json.tmp
