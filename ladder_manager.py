@@ -103,6 +103,12 @@ TRANSLATIONS = {
 
 log = logging.getLogger("ladder")
 
+
+def env_login(prefix="TL_"):
+    """TradeLocker login from env vars: TL_ENV/TL_EMAIL/TL_PASSWORD/TL_SERVER (demo) or TL_LIVE_* (live)."""
+    get = lambda key: os.environ.get(prefix + key) or os.environ["TL_" + key]     # live falls back to the demo login
+    return {"env": os.environ[prefix + "ENV"], "email": get("EMAIL"), "password": get("PASSWORD"), "server": get("SERVER")}
+
 DONE_STATUSES = ("STATUS_FILLED", "STATUS_CANCELED", "STATUS_REJECTED", "STATUS_EXPIRED")
 
 
@@ -111,8 +117,9 @@ class StreamFeed:
     Socket.IO callbacks only update the mirror (under lock) and set `changed`;
     the manager reads it from its own thread."""
 
-    def __init__(self, url, account_id, symbol):
+    def __init__(self, url, account_id, symbol, login):
         self.url = url
+        self.login = login
         self.account_id = str(account_id)
         self.symbol = symbol
         self.lock = threading.Lock()
@@ -133,9 +140,9 @@ class StreamFeed:
         return self.sio is not None and self.sio.connected and time.time() < self.expires_at - 120
 
     def _token(self):
-        r = requests.post(f"{os.environ['TL_ENV']}/backend-api/auth/jwt/accounts/tokens",
-                          json={"email": os.environ["TL_EMAIL"], "password": os.environ["TL_PASSWORD"],
-                                "server": os.environ["TL_SERVER"]}, timeout=10)
+        r = requests.post(f"{self.login['env']}/backend-api/auth/jwt/accounts/tokens",
+                          json={"email": self.login["email"], "password": self.login["password"],
+                                "server": self.login["server"]}, timeout=10)
         r.raise_for_status()
         data = r.json()
         data = data["data"] if isinstance(data, dict) and "data" in data else data
@@ -238,10 +245,11 @@ class StreamFeed:
 
 
 class LadderManager:
-    def __init__(self, params, state_file, account_id=None, stop_event=None):
+    def __init__(self, params, state_file, account_id=None, stop_event=None, login=None):
         self.p = params                 # shared dict: the Discord panel changes it while running
         self.state_file = state_file
         self.account_id = int(account_id or os.environ.get("TL_ACCOUNT_ID", "0"))
+        self.login = login or env_login()
         self.stop = stop_event or threading.Event()
         self.api = None
         self.instr_id = 0
@@ -350,10 +358,10 @@ class LadderManager:
     # ==================================================================
     def connect(self):
         self.api = TLAPI(
-            environment=os.environ["TL_ENV"],
-            username=os.environ["TL_EMAIL"],
-            password=os.environ["TL_PASSWORD"],
-            server=os.environ["TL_SERVER"],
+            environment=self.login["env"],
+            username=self.login["email"],
+            password=self.login["password"],
+            server=self.login["server"],
             account_id=self.account_id,
             log_level="info",
         )
@@ -848,7 +856,7 @@ class LadderManager:
     def _run(self, once):
         self.connect()
         if self.p["use_stream"] and os.environ.get("TL_DEV_KEY"):
-            self.feed = StreamFeed(self.p["stream_url"], self.api.account_id, self.p["symbol"])
+            self.feed = StreamFeed(self.p["stream_url"], self.api.account_id, self.p["symbol"], self.login)
             self._ensure_stream()
         else:
             log.info("no TL_DEV_KEY / use_stream=False - REST polling mode")

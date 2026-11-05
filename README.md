@@ -37,8 +37,9 @@ the server and this Mac together: stop the local copy before the server one star
 ## Server (Dokploy, project `trading`, app `ladder`)
 
 Dockerfile build, auto-deploy on push to `main`, volume `ladder-data` → `/data` (settings + per-account state).
-Env: `TL_ENV TL_SERVER TL_EMAIL TL_PASSWORD TL_DEV_KEY LADDER_DISCORD_TOKEN CONTROL_CHANNEL_ID ALLOWED_USER_ID
+Env: `TL_ENV TL_LIVE_ENV TL_SERVER TL_EMAIL TL_PASSWORD TL_DEV_KEY LADDER_DISCORD_TOKEN CONTROL_CHANNEL_ID ALLOWED_USER_ID
 DISCORD_WEBHOOK DISCORD_WEBHOOK_ALERT ACCOUNT_NOTES`. Secrets are in the Keychain / Bitwarden (`tradelocker-*`,
 `ladder-discord-token`, `discord-webhook-ladder*`).
 
+Accounts: demo ones by id ("590661"), live ones as "live:<id>" (same login on rba-live; switching to live always asks first).
 Demo 590661 is copied 1:1 to Colmex live by MetaCopier — everything laddered there is real money on Colmex.

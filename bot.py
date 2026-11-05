@@ -35,6 +35,24 @@ CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "sync_sl_delete")
 
 
+def logins():
+    """demo always; live when TL_LIVE_ENV is set (same email/password unless TL_LIVE_EMAIL/TL_LIVE_PASSWORD)."""
+    out = {"demo": lm.env_login("TL_")}
+    if os.environ.get("TL_LIVE_ENV"):
+        out["live"] = lm.env_login("TL_LIVE_")
+    return out
+
+
+def split_key(key):
+    """Account keys: "590661" = demo (kept bare from before live existed), "live:589911" = live."""
+    return ("live", key[5:]) if key.startswith("live:") else ("demo", key)
+
+
+def account_label(key):
+    kind, acc = split_key(key)
+    return f"{'🔴 LIVE' if kind == 'live' else 'Demo'} {acc}"
+
+
 def account_notes():
     notes = {}
     for item in os.environ.get("ACCOUNT_NOTES", "").split(";"):
@@ -109,10 +127,12 @@ class Engine:
         self.thread = None
 
     def _supervise(self, account, stop):
-        state_file = os.path.join(DATA_DIR, f"state-{account}.json")
+        kind, acc_id = split_key(account)
+        state_file = os.path.join(DATA_DIR, f"state-{account.replace(':', '-')}.json")
+        login = logins()[kind]
         while not stop.is_set():
             try:
-                self.manager = lm.LadderManager(self.params, state_file, account_id=account, stop_event=stop)
+                self.manager = lm.LadderManager(self.params, state_file, account_id=acc_id, stop_event=stop, login=login)
                 self.manager.on_alert = self._alert
                 self.error = ""
                 self.manager.run()
@@ -150,23 +170,27 @@ class Engine:
 
 
 def list_accounts():
-    """All accounts of the TradeLocker login: [(id, label)]."""
-    base = os.environ["TL_ENV"] + "/backend-api"
-    r = requests.post(base + "/auth/jwt/token", json={"email": os.environ["TL_EMAIL"], "password": os.environ["TL_PASSWORD"],
-                                                      "server": os.environ["TL_SERVER"]}, timeout=10)
-    r.raise_for_status()
-    token = r.json()["accessToken"]
-    r = requests.get(base + "/auth/jwt/all-accounts", headers={"Authorization": "Bearer " + token}, timeout=10)
-    r.raise_for_status()
+    """All accounts of the demo and live logins: [(key, label)]. (The API "name" is an internal brand#user id.)"""
     notes = account_notes()
-    kind = "Demo" if "demo" in os.environ["TL_ENV"] else "Live"    # the API "name" is an internal brand#user id
     out = []
-    for a in r.json()["accounts"]:
-        acc = str(a["id"])
-        label = f"{kind} {acc} · {float(a['accountBalance']):,.0f} {a['currency']}"
-        if acc in notes:
-            label += f" ⚠️ {notes[acc]}"
-        out.append((acc, label[:100]))
+    for kind, login in logins().items():
+        base = login["env"] + "/backend-api"
+        try:
+            r = requests.post(base + "/auth/jwt/token", json={"email": login["email"], "password": login["password"],
+                                                              "server": login["server"]}, timeout=10)
+            r.raise_for_status()
+            r = requests.get(base + "/auth/jwt/all-accounts", headers={"Authorization": "Bearer " + r.json()["accessToken"]},
+                             timeout=10)
+            r.raise_for_status()
+        except Exception as exc:
+            log.warning(f"{kind} accounts: {exc}")
+            continue
+        for a in r.json()["accounts"]:
+            key = str(a["id"]) if kind == "demo" else f"live:{a['id']}"
+            label = f"{account_label(key)} · {float(a['accountBalance']):,.2f} {a['currency']}"
+            if str(a["id"]) in notes:
+                label += f" ⚠️ {notes[str(a['id'])]}"
+            out.append((key, label[:100]))
     return out
 
 
@@ -177,8 +201,9 @@ def panel_embed(engine, settings):
     """The panel as plain lines, one setting per line (inline fields read badly in Hebrew)."""
     p = engine.params
     on = p["enabled"]
-    acc = settings.data["account"] or "—"
-    note = account_notes().get(acc)
+    key = settings.data["account"]
+    acc = account_label(key) if key else "—"
+    note = account_notes().get(split_key(key)[1]) if key else None
     cap = p["max_total_lots"]
     lines = [
         "🟢 **פועל** - משכפל עסקאות חדשות" if on else "🔴 **כבוי** - לא משכפל עסקאות חדשות (קבוצות פתוחות ממשיכות לקבל סנכרון SL)",
@@ -258,9 +283,9 @@ class ConfirmSwitch(discord.ui.View):
 
     @discord.ui.button(label="כן, להחליף", style=discord.ButtonStyle.danger)
     async def yes(self, interaction, button):
-        await interaction.response.edit_message(content=f"מחליף לחשבון {self.account}…", view=None)
+        await interaction.response.edit_message(content=f"מחליף לחשבון {account_label(self.account)}…", view=None)
         await self.panel.switch(self.account)
-        await interaction.edit_original_response(content=f"✅ השרת עבר לחשבון {self.account}")
+        await interaction.edit_original_response(content=f"✅ השרת עבר לחשבון {account_label(self.account)}")
 
     @discord.ui.button(label="ביטול", style=discord.ButtonStyle.secondary)
     async def no(self, interaction, button):
@@ -280,15 +305,24 @@ class AccountSelect(discord.ui.Select):
         if account == "none" or account == self.panel.settings.data["account"]:
             await interaction.response.defer()
             return
+        warn = []
         groups = self.panel.engine.open_groups()
         if groups:
-            await interaction.response.send_message(
-                f"יש {len(groups)} קבוצות פתוחות בחשבון הנוכחי. אחרי ההחלפה ה-SL שלהן לא יסונכרן יותר. להחליף בכל זאת?",
-                view=ConfirmSwitch(self.panel, account), ephemeral=True)
+            warn.append(f"יש {len(groups)} קבוצות פתוחות בחשבון הנוכחי - אחרי ההחלפה ה-SL שלהן לא יסונכרן יותר.")
+        if split_key(account)[0] == "live":
+            p = self.panel.engine.params
+            cap = self.panel.engine.limit(account)
+            warn.append(f"⚠️ **{account_label(account)} הוא חשבון אמיתי - כסף אמיתי.** "
+                        f"המצב עכשיו: {'🟢 דלוק' if p['enabled'] else '🔴 כבוי'}, "
+                        f"{'שכפול' if p['mode'] == 'duplicate' else 'חלוקה'} × {p['copies']}, "
+                        f"הגבלה: {f'{cap * 100:g} אונקיות' if cap else 'בלי'}.")
+        if warn:
+            await interaction.response.send_message("\n".join(warn) + "\nלהחליף?",
+                                                    view=ConfirmSwitch(self.panel, account), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.panel.switch(account)
-        await interaction.followup.send(f"✅ השרת עבר לחשבון {account}", ephemeral=True)
+        await interaction.followup.send(f"✅ השרת עבר לחשבון {account_label(account)}", ephemeral=True)
 
 
 class Panel(discord.ui.View):
@@ -367,7 +401,7 @@ class Panel(discord.ui.View):
         self.settings.data["account"] = account
         self.settings.save()
         await asyncio.to_thread(self.engine.start, account)
-        self.engine.note(f"🔁 עבר לחשבון {account}")
+        self.engine.note(f"🔁 עבר לחשבון {account_label(account)}")
         await self.refresh()
 
     async def refresh(self):

@@ -3,7 +3,7 @@
 # two managers on one account ladder every trade twice. Secrets come from the Keychain.
 cd "$(dirname "$0")"
 [ -d .venv ] || { python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt; }
-export TL_ENV="https://rba-demo.tradelocker.com" TL_SERVER="8CAP"
+export TL_ENV="https://rba-demo.tradelocker.com" TL_LIVE_ENV="https://rba-live.tradelocker.com" TL_SERVER="8CAP"
 export TL_EMAIL="$(security find-generic-password -a "$USER" -s tradelocker-demo-email -w)"
 export TL_PASSWORD="$(security find-generic-password -a "$USER" -s tradelocker-demo-password -w)"
 export TL_DEV_KEY="$(security find-generic-password -s tradelocker-dev-api-key -w)"
