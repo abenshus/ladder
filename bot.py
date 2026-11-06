@@ -2,7 +2,7 @@
 Ladder on the server: runs one or more ladders ("משכפלים"), each a ladder manager on its own TradeLocker account
 with its own on/off and settings, and a Discord control panel per ladder.
 
-#ladder (CONTROL_CHANNEL_ID): a pinned header on top (list of ladders, add / delete) and under it one panel
+#ladder (CONTROL_CHANNEL_ID): a guide first (what each button does, with examples), then a pinned header (list of ladders, add / delete) and under it one panel
   message per ladder, edited in place - on/off, account picker, mode / BE / runner / SL-delete toggles, settings modal.
   Two ladders never share an account (each trade would be laddered twice).
 #ladder-log: everything the manager reports (via DISCORD_WEBHOOK; errors also go to DISCORD_WEBHOOK_ALERT).
@@ -35,7 +35,11 @@ CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 
 # what the panel may change; everything else stays as in lm.PARAMS
 EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "lock_tp1_at",
-            "sync_sl_delete", "auto_sl", "runner_keep_be")
+            "sync_sl_delete", "auto_sl", "runner_keep_be", "step_every")
+
+# the 🔒 button cycles through these: (be_after_tp1, be_to, step_every)
+SL_MODES = [(False, "two_step", 1), (True, "two_step", 1), (True, "steps", 1), (True, "steps", 2),
+            (True, "tp1", 1), (True, "entry", 1)]
 
 
 def logins():
@@ -71,7 +75,7 @@ def account_notes():
 class Settings:
     def __init__(self):
         # ladders: [{id, account, panel_message, params}]; limits: account -> max lots of a whole ladder (per account)
-        self.data = {"header_message": 0, "ladders": [], "limits": {}}
+        self.data = {"guide_message": 0, "header_message": 0, "ladders": [], "limits": {}}
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE) as f:
                 loaded = json.load(f)
@@ -237,6 +241,11 @@ def list_accounts():
 def after_tp1_text(p):
     if not p["be_after_tp1"]:
         return "ה-SL לא זז"
+    if p["be_to"] == "steps" and p["step_every"] == 1:
+        return f"מדרגות - כל TP ה-SL של כולן (כולל ה-Runner) עולה מדרגה: TP1 → כניסה +{p['be_offset']:g}$, TP2 → TP1, TP3 → TP2…"
+    if p["be_to"] == "steps":
+        return (f"מדרגות כל 2 TP - ה-SL של כולן (כולל ה-Runner): TP2 → כניסה +{p['be_offset']:g}$, "
+                f"TP4 → TP2, TP6 → TP4…")
     if p["be_to"] == "two_step":
         where = "TP2" if p["lock_tp1_at"] >= 1 else f"{p['lock_tp1_at'] * 100:g}% מהדרך ל-TP2"
         return f"ה-SL של השאר לכניסה +{p['be_offset']:g}$, וכשהמחיר מגיע ל-{where} - ל-TP1" + runner_text(p)
@@ -249,6 +258,62 @@ def runner_text(p):
     if p["runner_keep_be"] and p["runner_last"]:
         return f" · ה-Runner נשאר בכניסה +{p['be_offset']:g}$"
     return ""
+
+
+GUIDE = [
+    ("📖 מדריך - מה המשכפל עושה", 0x95a5a6, """\
+אתה פותח עסקה אחת ב-TradeLocker (ידנית, או פקודת Limit/Stop) - המשכפל הופך אותה ל**סולם** של כמה עסקאות באותו כיוון, \
+כל אחת עם TP אחר, ומנהל להן את הסטופ ביחד.
+
+**דוגמה:** קנייה ב-**4000**, SL **3989**, הגדרות: 5 עסקאות · מרחק בין TP-ים 3$ · Runner דלוק
+• עסקה 1 → TP **4003**
+• עסקה 2 → TP **4006**
+• עסקה 3 → TP **4009**
+• עסקה 4 → TP **4012**
+• עסקה 5 → **Runner** - בלי TP, רצה עד הסטופ
+לכולן אותו SL (3989). הזזת ה-SL באחת → כולן זזות איתה.
+
+**פקודה ממתינה:** Limit/Stop מקבלת סולם של פקודות ממתינות באותו מחיר. הזזת המחיר של הפקודה שלך מזיזה את כולן, ביטול מבטל את כולן.
+
+**איך מתחילים:** בלוח של המשכפל → בוחרים חשבון בתפריט → 🟢 הדלק → פותחים עסקה כרגיל."""),
+    ("🎛 הכפתורים", 0x95a5a6, """\
+🟢 **הדלק / 🔴 כבה** - כבוי = לא משכפל עסקאות **חדשות**. קבוצות שכבר פתוחות ממשיכות לקבל סנכרון סטופ.
+⚙️ **הגדרות** - כמה עסקאות בסולם (2-10), מרחק בין TP-ים בדולרים, ומקסימום אונקיות לכל הסולם בחשבון.
+🛡 **סטופ** - סטופ אוטומטי (עסקה שנפתחה בלי SL מקבלת SL במרחק הזה, למשל 10$), BE offset (כמה מעבר לכניסה \
+הסטופ נכנס, למשל 0.5$ = נועל 0.5$ לאונקיה), ונעילת TP1 במצב "שני שלבים".
+🔄 **רענן** - טוען מחדש את רשימת החשבונות.
+✂️ **חלוקה / שכפול** - עסקה של 0.10 לוט, 5 עסקאות:
+  • **שכפול** → 5 × 0.10 = 0.50 לוט בסך הכול (50 אונקיות)
+  • **חלוקה** → 5 × 0.02 = נשאר 0.10 לוט, מחולק לסולם
+🔒 **סטופ אחרי TP** - מה קורה לסטופ כשה-TP-ים נתפסים (פירוט בהודעה הבאה). כל לחיצה עוברת למצב הבא.
+🏃 **Runner** - העסקה האחרונה בלי TP (דלוק) או עם TP כמו כולן (כבוי).
+🚫 **מחיקת SL** - מחקת SL מעסקה אחת: נמחק מכולן, או שהמשכפל מחזיר לה את ה-SL.
+🎯 **Runner בכניסה** - במצבים "שני שלבים" ו"מיד ל-TP1": כשהשאר עוברות ל-TP1, ה-Runner נשאר בכניסה (סיכון 0, יותר מקום לרוץ). \
+במצבי המדרגות ה-Runner תמיד עולה יחד עם כולן."""),
+    ("🔒 מצבי הסטופ אחרי TP - בדוגמה של קנייה ב-4000", 0x95a5a6, """\
+(5 עסקאות · TP כל 3$: 4003 / 4006 / 4009 / 4012 · SL 3989 · BE offset 0.5$)
+
+**כבוי** - הסטופ לא זז. כל עסקה נסגרת ב-TP שלה או ב-3989.
+
+**שני שלבים** - TP1 (4003) נתפס → SL של השאר **4000.5**. המחיר מגיע לחצי הדרך ל-TP2 (4004.5) → SL **4003**.
+
+**🪜 מדרגה בכל TP** - כל TP שנתפס, הסטופ של כולן עולה מדרגה אחת:
+4003 → SL **4000.5** · 4006 → SL **4003** · 4009 → SL **4006** · 4012 → SL **4009** · \
+ה-Runner ממשיך: 4015 → SL **4012**, 4018 → SL **4015**…
+
+**🪜 מדרגה כל 2 TP** - מחכים לשני TP-ים, ואז קופצים:
+4003 → כלום · 4006 → SL **4000.5** · 4009 → כלום · 4012 → SL **4006** · ה-Runner: 4018 → SL **4012**…
+
+**מיד ל-TP1** - TP1 נתפס → SL של השאר **4003** מיד.
+**לכניסה** - TP1 נתפס → SL של השאר **4000.5** ונשאר שם.
+
+**מה לבחור?** "מדרגה בכל TP" שומר יותר על הרווח: מעט עסקאות חוזרות להפסד, הרווח קטן יותר. \
+"מדרגה כל 2 TP" נותן לעסקה מקום לנשום: פחות עסקאות מרוויחות, אבל הרווח הממוצע גבוה יותר."""),
+]
+
+
+def guide_embeds():
+    return [discord.Embed(title=title, description=text, color=color) for title, color, text in GUIDE]
 
 
 def header_embed(engines):
@@ -276,7 +341,7 @@ def panel_embed(engine):
         f"**מרחק בין TP-ים:** {p['tp_step']:g}$",
         f"**Runner (אחרונה בלי TP):** {'כן' if p['runner_last'] else 'לא'}",
         "**סטופ אוטומטי:** " + (f"{p['auto_sl']:g}$ מהכניסה לעסקה שנפתחה בלי SL" if p["auto_sl"] else "בלי"),
-        "**אחרי TP1:** " + after_tp1_text(p),
+        "**סטופ אחרי TP:** " + after_tp1_text(p),
         f"**מחיקת SL מעסקה:** {'מוחקת מכולן' if p['sync_sl_delete'] else 'מחזירה לה את ה-SL'}",
         f"**הגבלה לחשבון:** " + (f"{cap * 100:g} אונקיות לכל הסולם" if cap else "בלי הגבלה"),
         "",
@@ -482,20 +547,18 @@ class Panel(discord.ui.View):
         new = "duplicate" if self.engine.params["mode"] == "split" else "split"
         await self._toggle(interaction, "mode", new, "✂️ מצב: " + ("שכפול" if new == "duplicate" else "חלוקה"))
 
-    @discord.ui.button(label="SL אחרי TP1", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
+    @discord.ui.button(label="סטופ אחרי TP", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
     async def be(self, interaction, button):
-        # cycles: off -> two steps (entry, then TP1) -> TP1 at once -> entry only -> off
+        # cycles: off -> two steps -> steps every TP -> steps every 2 TPs -> TP1 at once -> entry only -> off
         p = self.engine.params
-        if not p["be_after_tp1"]:
-            self.engine.set("be_to", "two_step")
-            self.engine.set("be_after_tp1", True)
-        elif p["be_to"] == "two_step":
-            self.engine.set("be_to", "tp1")
-        elif p["be_to"] == "tp1":
-            self.engine.set("be_to", "entry")
-        else:
-            self.engine.set("be_after_tp1", False)
-        await self.confirm(interaction, "🔒 אחרי TP1: " + after_tp1_text(p))
+        now = (p["be_after_tp1"], p["be_to"] if p["be_after_tp1"] else "two_step",
+               p["step_every"] if p["be_to"] == "steps" else 1)
+        i = SL_MODES.index(now) if now in SL_MODES else 0
+        on, to, every = SL_MODES[(i + 1) % len(SL_MODES)]
+        self.engine.set("be_to", to)
+        self.engine.set("step_every", every)
+        self.engine.set("be_after_tp1", on)
+        await self.confirm(interaction, "🔒 סטופ אחרי TP: " + after_tp1_text(p))
 
     @discord.ui.button(label="Runner", emoji="🏃", style=discord.ButtonStyle.primary, custom_id="ladder:runner", row=1)
     async def runner(self, interaction, button):
@@ -622,9 +685,36 @@ class LadderBot(discord.Client):
         return self.get_channel(CONTROL_CHANNEL_ID) or await self.fetch_channel(CONTROL_CHANNEL_ID)
 
     async def render_all(self):
+        await self.render_guide()
         await self.render_header()
         for engine in self.engines:
             await self.render_panel(engine)
+
+    async def render_guide(self):
+        async with self.panel_lock:
+            channel = await self._channel()
+            msg_id = self.settings.data["guide_message"]
+            if msg_id:
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                    await msg.edit(content=None, embeds=guide_embeds())
+                    return
+                except discord.NotFound:
+                    pass
+            # the guide is the first message: the header and the panels are reposted under it
+            ladders = self.settings.data["ladders"]
+            for mid in [self.settings.data["header_message"]] + [lad["panel_message"] for lad in ladders]:
+                if mid:
+                    try:
+                        await (await channel.fetch_message(mid)).delete()
+                    except discord.HTTPException:
+                        pass
+            self.settings.data["header_message"] = 0
+            for ladder in ladders:
+                ladder["panel_message"] = 0
+            msg = await channel.send(embeds=guide_embeds())
+            self.settings.data["guide_message"] = msg.id
+            self.settings.save()
 
     async def render_header(self):
         async with self.panel_lock:

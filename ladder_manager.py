@@ -19,6 +19,10 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
    "two_step" (ברירת מחדל): TP1 נתפס -> SL לכניסה + be_offset; המחיר הגיע ל-lock_tp1_at מהדרך TP1→TP2
               (0.5 = חצי הדרך, 1 = TP2) או ש-TP2 נתפס -> SL ל-TP1.
    "tp1": SL ל-TP1 מיד כש-TP1 נתפס.  "entry": SL לכניסה + be_offset.
+   "steps": מדרגות - כל step_every רמות (TP) שהמחיר עבר, ה-SL של כולן (כולל ה-Runner) עולה מדרגה:
+            step_every=1: TP1 -> כניסה + be_offset, TP2 -> TP1, TP3 -> TP2 ...
+            step_every=2: TP2 -> כניסה + be_offset, TP4 -> TP2, TP6 -> TP4 ...
+            אחרי ה-TP האחרון ה-Runner ממשיך לעלות במדרגות לפי המחיר (כל tp_step נוסף).
    המחיר הנוכחי מגיע מה-PnL של העסקאות ב-stream (כל ~2 שניות); ב-polling שלב 2 רק כש-TP2 נתפס.
 
 עסקאות של בוטים אחרים (strategyId לא ריק, למשל HGUARD) לא נוגעים בהן.
@@ -61,7 +65,8 @@ PARAMS = dict(
     sync_sl=True,               # הזזת SL באחת -> לכולן
     sync_sl_delete=True,        # מחיקת SL מאחת -> נמחק מכולן (False = מחזירים לה את ה-SL של הקבוצה)
     be_after_tp1=False,         # אחרי TP1 - SL של השאר זז (לאן: be_to)
-    be_to="two_step",           # "two_step" = כניסה ואז TP1 | "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset
+    be_to="two_step",           # "two_step" = כניסה ואז TP1 | "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset | "steps" = מדרגות
+    step_every=1,               # steps: כל כמה TP-ים ה-SL עולה מדרגה (1 = כל TP, 2 = כל שני TP-ים)
     be_offset=0.0,              # SL לכניסה: כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
     lock_tp1_at=0.5,            # two_step: SL ל-TP1 כשהמחיר עבר את החלק הזה מהדרך TP1→TP2 (0.5 = חצי, 1 = TP2)
     runner_keep_be=True,        # כשה-SL של השאר עובר ל-TP1, ה-Runner נשאר בכניסה + be_offset (נותנים לו לרוץ בסיכון 0)
@@ -89,6 +94,7 @@ TRANSLATIONS = {
         "sl_cleared": "🚫 <b>סטופ נמחק מכל העסקאות</b>",
         "be": "🔒 <b>TP1 נתפס - סטופ הוזז</b>",
         "lock_tp1": "🔐 <b>המחיר המשיך - סטופ ל-TP1</b>",
+        "step_up": "🪜 <b>מדרגה - סטופ עלה</b>",
         "group_done": "🏁 <b>הקבוצה נסגרה</b>",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
@@ -105,6 +111,7 @@ TRANSLATIONS = {
         "sl_cleared": "🚫 <b>Stop removed from all trades</b>",
         "be": "🔒 <b>TP1 hit - stop moved</b>",
         "lock_tp1": "🔐 <b>Price ran on - stop to TP1</b>",
+        "step_up": "🪜 <b>Step - stop moved up</b>",
         "group_done": "🏁 <b>Group closed</b>",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
@@ -749,8 +756,38 @@ class LadderManager:
         log.info(f"set SL {pid} -> {target} via {via} ok={ok} attempt={attempts}")
         self.sl_pending[pid] = (target, now, attempts)
 
+    def _move_steps(self, g, members, clear):
+        """be_to="steps": every step_every levels reached, the SL of all of them (runner included) goes up one step -
+        level N reached -> SL to level N - step_every (level 0 = entry + be_offset, level k = TP k)."""
+        sign = 1 if g["side"] == "buy" else -1
+        step = g["step"] if "step" in g else self.p["tp_step"]
+        tp1 = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * step)
+        every = max(1, int(self.p["step_every"]))
+        reached = g["max_members"] - len(members)          # TPs filled
+        marks = [m["mark"] for m in members if m["mark"] is not None]
+        if marks:
+            # past the last TP only the runner is left: the price says how many levels it went
+            reached = max(reached, int((marks[0] - tp1) * sign / step + 1e-9) + 1)
+        level = reached // every * every
+        done = g["step_level"] if "step_level" in g else 0
+        if level < every or level <= done:
+            return clear
+        g["step_level"] = level
+        j = level - every
+        sl = self._round(g["entry"] + sign * self.p["be_offset"]) if j == 0 else self._round(tp1 + sign * step * (j - 1))
+        if g["target_sl"] is not None and (sl - g["target_sl"]) * sign <= 0:
+            return clear
+        if "runner_sl" in g:
+            del g["runner_sl"]          # in steps the runner climbs with the rest
+        g["target_sl"] = sl
+        g["clear_sl"] = False
+        self._broadcast(self._t("step_up"), [f"TP{level} → {self._t('sl')}: {sl}" + (" (BE)" if j == 0 else f" (TP{j})")])
+        return False
+
     def _move_after_tp1(self, g, members, clear):
         """SL of the rest after TP1 (see be_to). Returns the group's clear flag."""
+        if self.p["be_to"] == "steps":
+            return self._move_steps(g, members, clear)
         stage = g["be_stage"] if "be_stage" in g else (2 if "be_done" in g and g["be_done"] else 0)
         hits = g["max_members"] - len(members)
         if hits < 1 or stage == 2:
