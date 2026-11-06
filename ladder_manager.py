@@ -15,6 +15,7 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
 3. סנכרון סטופ: הזזת SL באחת מעסקאות הקבוצה -> אותו SL לכל השאר.
    auto_sl: עסקה/פקודה בלי SL מקבלת SL במרחק הזה מהכניסה (ברירת מחדל 10$, 0 = בלי). מחיקה שלו = כמו כל SL (sync_sl_delete).
 4. be_after_tp1=True -> הסטופ של השאר זז אחרי TP1. be_to:
+   runner_keep_be=True -> כשהשאר עוברות ל-TP1, ה-Runner נשאר בכניסה + be_offset.
    "two_step" (ברירת מחדל): TP1 נתפס -> SL לכניסה + be_offset; המחיר הגיע ל-lock_tp1_at מהדרך TP1→TP2
               (0.5 = חצי הדרך, 1 = TP2) או ש-TP2 נתפס -> SL ל-TP1.
    "tp1": SL ל-TP1 מיד כש-TP1 נתפס.  "entry": SL לכניסה + be_offset.
@@ -63,6 +64,7 @@ PARAMS = dict(
     be_to="two_step",           # "two_step" = כניסה ואז TP1 | "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset
     be_offset=0.0,              # SL לכניסה: כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
     lock_tp1_at=0.5,            # two_step: SL ל-TP1 כשהמחיר עבר את החלק הזה מהדרך TP1→TP2 (0.5 = חצי, 1 = TP2)
+    runner_keep_be=True,        # כשה-SL של השאר עובר ל-TP1, ה-Runner נשאר בכניסה + be_offset (נותנים לו לרוץ בסיכון 0)
     handle_pending=True,        # לשכפל גם פקודות Limit/Stop
     use_stream=True,            # Streams API (צריך TL_DEV_KEY); False = polling
     stream_url="https://api.tradelocker.com",
@@ -772,10 +774,22 @@ class LadderManager:
         g["be_stage"] = stage
         if be is None or not (g["target_sl"] is None or (be - g["target_sl"]) * sign > 0):
             return clear
+        lines = [f"{self._t('sl')}: {be}"]
+        if self.p["runner_keep_be"] and not self._same(be, entry_sl) and any(m["tp"] is None for m in members):
+            # the runner keeps the entry SL (or a better one it already had) so one trade rides the whole move
+            keep = g["target_sl"] if g["target_sl"] is not None and (g["target_sl"] - entry_sl) * sign > 0 else entry_sl
+            g["runner_sl"] = keep
+            lines.append(f"Runner: {keep}")
         g["target_sl"] = be
         g["clear_sl"] = False
-        self._broadcast(self._t(header), [f"{self._t('sl')}: {be}"])
+        self._broadcast(self._t(header), lines)
         return False
+
+    def _want_sl(self, g, m):
+        """The SL a member should have: the group's, except the runner after its SL was kept at entry."""
+        if "runner_sl" in g and m["tp"] is None:
+            return g["runner_sl"]
+        return g["target_sl"]
 
     def _handle_open_groups(self, positions):
         now = time.time()
@@ -809,11 +823,13 @@ class LadderManager:
                 for m in members:
                     prev = g["seen_sl"][m["id"]] if m["id"] in g["seen_sl"] else "unseen"
                     if prev != "unseen" and not self._same(prev, m["sl"]):
-                        if m["sl"] is not None and (clear or not self._same(m["sl"], g["target_sl"])):
+                        if m["sl"] is not None and (clear or not self._same(m["sl"], self._want_sl(g, m))):
                             changed_to = m["sl"]
                         elif m["sl"] is None and g["target_sl"] is not None and self.p["sync_sl_delete"]:
                             removed = True
                     g["seen_sl"][m["id"]] = m["sl"]
+                if "runner_sl" in g and (changed_to is not None or removed):
+                    del g["runner_sl"]          # the user's own SL change goes to all of them, runner included
                 if changed_to is not None:
                     g["target_sl"] = changed_to
                     g["clear_sl"] = clear = False
@@ -830,8 +846,9 @@ class LadderManager:
             if g["target_sl"] is not None or clear:
                 calls = []
                 for m in members:
-                    if not self._same(m["sl"], g["target_sl"]):
-                        calls.append(self.pool.submit(self._set_sl, m, g["target_sl"], now))
+                    want = self._want_sl(g, m)
+                    if not self._same(m["sl"], want):
+                        calls.append(self.pool.submit(self._set_sl, m, want, now))
                     elif m["id"] in self.sl_pending:
                         del self.sl_pending[m["id"]]
                 for c in calls:

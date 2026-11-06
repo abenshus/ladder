@@ -35,7 +35,7 @@ CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 
 # what the panel may change; everything else stays as in lm.PARAMS
 EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "lock_tp1_at",
-            "sync_sl_delete", "auto_sl")
+            "sync_sl_delete", "auto_sl", "runner_keep_be")
 
 
 def logins():
@@ -239,10 +239,16 @@ def after_tp1_text(p):
         return "ה-SL לא זז"
     if p["be_to"] == "two_step":
         where = "TP2" if p["lock_tp1_at"] >= 1 else f"{p['lock_tp1_at'] * 100:g}% מהדרך ל-TP2"
-        return f"ה-SL של השאר לכניסה +{p['be_offset']:g}$, וכשהמחיר מגיע ל-{where} - ל-TP1"
+        return f"ה-SL של השאר לכניסה +{p['be_offset']:g}$, וכשהמחיר מגיע ל-{where} - ל-TP1" + runner_text(p)
     if p["be_to"] == "tp1":
-        return "ה-SL של השאר עובר ל-TP1 (נועל את רווח TP1)"
+        return "ה-SL של השאר עובר ל-TP1 (נועל את רווח TP1)" + runner_text(p)
     return f"ה-SL של השאר עובר לכניסה +{p['be_offset']:g}$"
+
+
+def runner_text(p):
+    if p["runner_keep_be"] and p["runner_last"]:
+        return f" · ה-Runner נשאר בכניסה +{p['be_offset']:g}$"
+    return ""
 
 
 def header_embed(engines):
@@ -501,6 +507,13 @@ class Panel(discord.ui.View):
         new = not self.engine.params["sync_sl_delete"]
         await self._toggle(interaction, "sync_sl_delete", new,
                            "🚫 מחיקת SL: " + ("מוחקת מכולן" if new else "מחזירה את ה-SL"))
+
+    @discord.ui.button(label="Runner בכניסה", emoji="🎯", style=discord.ButtonStyle.primary, custom_id="ladder:runbe", row=1)
+    async def runner_be(self, interaction, button):
+        new = not self.engine.params["runner_keep_be"]
+        await self._toggle(interaction, "runner_keep_be", new,
+                           "🎯 Runner: " + ("ה-SL שלו נשאר בכניסה כשהשאר עוברות ל-TP1" if new
+                                           else "עובר ל-TP1 יחד עם השאר"))
 
     async def switch(self, account):
         self.engine.ladder["account"] = account
