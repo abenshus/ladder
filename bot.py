@@ -35,7 +35,7 @@ CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 
 # what the panel may change; everything else stays as in lm.PARAMS
 EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "lock_tp1_at",
-            "sync_sl_delete")
+            "sync_sl_delete", "auto_sl")
 
 
 def logins():
@@ -269,6 +269,7 @@ def panel_embed(engine):
         f"**עסקאות:** {p['copies']}",
         f"**מרחק בין TP-ים:** {p['tp_step']:g}$",
         f"**Runner (אחרונה בלי TP):** {'כן' if p['runner_last'] else 'לא'}",
+        "**סטופ אוטומטי:** " + (f"{p['auto_sl']:g}$ מהכניסה לעסקה שנפתחה בלי SL" if p["auto_sl"] else "בלי"),
         "**אחרי TP1:** " + after_tp1_text(p),
         f"**מחיקת SL מעסקה:** {'מוחקת מכולן' if p['sync_sl_delete'] else 'מחזירה לה את ה-SL'}",
         f"**הגבלה לחשבון:** " + (f"{cap * 100:g} אונקיות לכל הסולם" if cap else "בלי הגבלה"),
@@ -299,41 +300,68 @@ class SettingsModal(discord.ui.Modal):
         p = panel.engine.params
         self.copies = discord.ui.TextInput(label="כמה עסקאות בסך הכול (2-10)", default=str(p["copies"]), max_length=2)
         self.tp_step = discord.ui.TextInput(label="מרחק בין TP-ים בדולרים", default=str(p["tp_step"]), max_length=6)
-        self.be_offset = discord.ui.TextInput(label="SL לכניסה: כמה דולר מעבר לכניסה", default=str(p["be_offset"]), max_length=6)
         # in ounces: "20" is 20 oz (0.2 lot) - lots invited typing 20 for 20 oz
         self.max_oz = discord.ui.TextInput(label="מקסימום אונקיות לכל הסולם (0 = בלי הגבלה)",
                                            default=f"{p['max_total_lots'] * 100:g}", max_length=6)
-        self.lock_at = discord.ui.TextInput(label="SL ל-TP1 אחרי חלק מהדרך ל-TP2 (0.5 / 1)",
-                                            default=f"{p['lock_tp1_at']:g}", max_length=4)
-        for item in (self.copies, self.tp_step, self.be_offset, self.lock_at, self.max_oz):
+        for item in (self.copies, self.tp_step, self.max_oz):
             self.add_item(item)
 
     async def on_submit(self, interaction):
+        p = self.panel.engine.params
         try:
             copies = int(self.copies.value)
             tp_step = float(self.tp_step.value)
-            be_offset = float(self.be_offset.value)
             max_oz = float(self.max_oz.value)
-            lock_at = float(self.lock_at.value)
             max_lots = round(max_oz / 100, 2)
-            if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not 0 <= be_offset < tp_step or not 0 <= max_oz <= 500 \
-                    or not 0 < lock_at <= 1:
+            if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not p["be_offset"] < tp_step \
+                    or not 0 <= max_oz <= 500:
                 raise ValueError
         except ValueError:
             await interaction.response.send_message(
-                "ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100, BE offset בין 0 למרחק ה-TP, נעילת TP1 בין 0 ל-1, מקסימום אונקיות 0-500.",
-                ephemeral=True)
+                f"ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100 (וגדול מ-BE offset {p['be_offset']:g}$), "
+                "מקסימום אונקיות 0-500.", ephemeral=True)
             return
         account = self.panel.engine.account
         if account:
             self.panel.engine.set_limit(account, max_lots)
         self.panel.engine.set("copies", copies)
         self.panel.engine.set("tp_step", tp_step)
+        cap = f"{max_oz:g} אונקיות" if max_lots else "בלי"
+        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · הגבלה {cap}")
+
+
+class StopModal(discord.ui.Modal):
+    def __init__(self, panel):
+        super().__init__(title=f"סטופ לוס · {panel.engine.name}")
+        self.panel = panel
+        p = panel.engine.params
+        self.auto_sl = discord.ui.TextInput(label="סטופ אוטומטי: דולרים מהכניסה (0 = בלי)",
+                                            default=f"{p['auto_sl']:g}", max_length=6)
+        self.be_offset = discord.ui.TextInput(label="SL לכניסה: כמה דולר מעבר לכניסה", default=f"{p['be_offset']:g}",
+                                              max_length=6)
+        self.lock_at = discord.ui.TextInput(label="SL ל-TP1 אחרי חלק מהדרך ל-TP2 (0.5 / 1)",
+                                            default=f"{p['lock_tp1_at']:g}", max_length=4)
+        for item in (self.auto_sl, self.be_offset, self.lock_at):
+            self.add_item(item)
+
+    async def on_submit(self, interaction):
+        p = self.panel.engine.params
+        try:
+            auto_sl = float(self.auto_sl.value)
+            be_offset = float(self.be_offset.value)
+            lock_at = float(self.lock_at.value)
+            if not 0 <= auto_sl <= 200 or not 0 <= be_offset < p["tp_step"] or not 0 < lock_at <= 1:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(
+                f"ערכים לא תקינים: סטופ אוטומטי 0-200, BE offset בין 0 למרחק ה-TP ({p['tp_step']:g}$), "
+                "נעילת TP1 בין 0 ל-1.", ephemeral=True)
+            return
+        self.panel.engine.set("auto_sl", auto_sl)
         self.panel.engine.set("be_offset", be_offset)
         self.panel.engine.set("lock_tp1_at", lock_at)
-        cap = f"{max_oz:g} אונקיות" if max_lots else "בלי"
-        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · BE +{be_offset:g}$ · "
-                                         f"TP1 אחרי {lock_at:g} · הגבלה {cap}")
+        await self.panel.confirm(interaction, f"✅ סטופ: אוטומטי {f'{auto_sl:g}$' if auto_sl else 'בלי'} · "
+                                         f"BE +{be_offset:g}$ · TP1 אחרי {lock_at:g}")
 
 
 class ConfirmSwitch(discord.ui.View):
@@ -432,6 +460,10 @@ class Panel(discord.ui.View):
     @discord.ui.button(label="הגדרות", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="ladder:settings", row=0)
     async def settings_button(self, interaction, button):
         await interaction.response.send_modal(SettingsModal(self))
+
+    @discord.ui.button(label="סטופ", emoji="🛡", style=discord.ButtonStyle.secondary, custom_id="ladder:stop", row=0)
+    async def stop_button(self, interaction, button):
+        await interaction.response.send_modal(StopModal(self))
 
     @discord.ui.button(label="רענן", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="ladder:refresh", row=0)
     async def refresh_button(self, interaction, button):

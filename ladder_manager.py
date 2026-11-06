@@ -13,6 +13,7 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
 2. פקודת Limit/Stop ידנית חדשה -> מוסיף copies-1 פקודות באותו מחיר עם TP מדורג.
    הזזת המחיר של הפקודה שלך מזיזה את כולן (כולל ה-TP), ביטול מבטל את כולן.
 3. סנכרון סטופ: הזזת SL באחת מעסקאות הקבוצה -> אותו SL לכל השאר.
+   auto_sl: עסקה/פקודה בלי SL מקבלת SL במרחק הזה מהכניסה (ברירת מחדל 10$, 0 = בלי). מחיקה שלו = כמו כל SL (sync_sl_delete).
 4. be_after_tp1=True -> הסטופ של השאר זז אחרי TP1. be_to:
    "two_step" (ברירת מחדל): TP1 נתפס -> SL לכניסה + be_offset; המחיר הגיע ל-lock_tp1_at מהדרך TP1→TP2
               (0.5 = חצי הדרך, 1 = TP2) או ש-TP2 נתפס -> SL ל-TP1.
@@ -55,6 +56,7 @@ PARAMS = dict(
     lot_step=0.01,              # split: הלוט הכי קטן; אם אין מספיק ל-copies - פחות עסקאות, השארית אצלך
     tp_step=2.0,                # מרווח בין ה-TP-ים (דולר במחיר)
     runner_last=True,           # העסקה האחרונה בלי TP
+    auto_sl=10.0,               # עסקה בלי SL מקבלת SL במרחק הזה מהכניסה (דולר במחיר, 0 = בלי)
     sync_sl=True,               # הזזת SL באחת -> לכולן
     sync_sl_delete=True,        # מחיקת SL מאחת -> נמחק מכולן (False = מחזירים לה את ה-SL של הקבוצה)
     be_after_tp1=False,         # אחרי TP1 - SL של השאר זז (לאן: be_to)
@@ -88,7 +90,7 @@ TRANSLATIONS = {
         "group_done": "🏁 <b>הקבוצה נסגרה</b>",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
-        "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
+        "auto": "אוטומטי", "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
     },
     "en": {
         "start": "🚀 Ladder Manager started",
@@ -104,7 +106,7 @@ TRANSLATIONS = {
         "group_done": "🏁 <b>Group closed</b>",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
-        "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
+        "auto": "auto", "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
     },
 }
 
@@ -493,10 +495,16 @@ class LadderManager:
             self.tags[str(oid)] = tag
         return oid
 
-    def _pending(self, src, qty, tp, tag):
+    def _auto_sl(self, sl, entry, side):
+        """(sl, added): the trade's own SL, or one auto_sl away from entry when it has none."""
+        if sl or not self.p["auto_sl"]:
+            return sl or None, False
+        sign = 1 if side == "buy" else -1
+        return self._round(entry - sign * self.p["auto_sl"]), True
+
+    def _pending(self, src, qty, tp, sl, tag):
         if not self.p["active"]:
             return None
-        sl = src["sl"] or None
         price = src["price"] if src["type"] == "limit" else None
         stop_price = src["stop_price"] if src["type"] == "stop" else None
         oid = self.api.create_order(
@@ -573,9 +581,14 @@ class LadderManager:
             self._broadcast(self._t("error"), [f"partial close {reduce} failed - no copies opened"])
             return
         levels = self._tp_levels(pos["price"], pos["side"], count)
+        sl, auto = self._auto_sl(pos["sl"], pos["price"], pos["side"])
+        # one PATCH sets SL and TP together (a missing field clears it); a TP whose order hasn't arrived yet
+        # is left alone - the group's SL sync gives that trade the SL
         if not pos["has_tp"] and levels[0] is not None:
-            self.pool.submit(self._protect, pos, pos["sl"], levels[0])
-        futures = [self.pool.submit(self._market, pos["side"], per, tp, pos["sl"], tag) for tp in levels[1:]]
+            self.pool.submit(self._protect, pos, sl, levels[0])
+        elif auto and pos["tp"] is not None:
+            self.pool.submit(self._protect, pos, sl, pos["tp"])
+        futures = [self.pool.submit(self._market, pos["side"], per, tp, sl, tag) for tp in levels[1:]]
         opened = 1
         errors = []
         for f in futures:
@@ -588,14 +601,14 @@ class LadderManager:
             self._broadcast(self._t("error"), errors[:1])
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
-            "target_sl": pos["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
+            "target_sl": sl if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
             "tp1": levels[0], "step": self.p["tp_step"],
         }
         self._broadcast(self._t("ladder"), [
             f"{self._t('side')}: {pos['side']}  {self._lot_line(pos['qty'], count, per, reduce, opened)}",
             f"{self._t('price')}: {pos['price']}",
             f"{self._t('tps')}: {', '.join(str(x) if x else '—' for x in levels)}",
-            f"{self._t('sl')}: {pos['sl'] or '—'}",
+            f"{self._t('sl')}: {sl or '—'}" + (f" ({self._t('auto')})" if auto else ""),
         ])
 
     def _adopt_group(self, tag, pos):
@@ -615,17 +628,20 @@ class LadderManager:
             return
         levels = self._tp_levels(entry, order["side"], count)
         tp1 = order["tp"] or levels[0]
+        sl, auto = self._auto_sl(order["sl"], entry, order["side"])
         if reduce:
             # modify replaces the order's SL/TP too, so send them with the new size
             params = {"qty": str(round(order["qty"] - reduce, 2))}
             params.update({"price": entry} if order["type"] == "limit" else {"stopPrice": entry})
-            params.update(self._order_prot(order["sl"], tp1))
+            params.update(self._order_prot(sl, tp1))
             if not self._modify_order(order["id"], params):
                 self._broadcast(self._t("error"), [f"resize order to {params['qty']} failed - no copies placed"])
                 return
-        elif not order["tp"] and levels[0] is not None:
-            self.pool.submit(self._modify_order, order["id"], self._order_prot(order["sl"], levels[0]))
-        futures = [self.pool.submit(self._pending, order, per, tp, tag) for tp in levels[1:]]
+        elif (not order["tp"] and levels[0] is not None) or auto:
+            params = {"price": entry} if order["type"] == "limit" else {"stopPrice": entry}
+            params.update(self._order_prot(sl, tp1))
+            self.pool.submit(self._modify_order, order["id"], params)
+        futures = [self.pool.submit(self._pending, order, per, tp, sl, tag) for tp in levels[1:]]
         errors = []
         for f in futures:
             try:
@@ -637,13 +653,15 @@ class LadderManager:
         self.state["groups"][tag] = {
             "kind": "pending", "side": order["side"], "entry": entry, "parent_order": order["id"],
             "type": order["type"],
-            "target_sl": (order["sl"] or None) if self.p["sync_sl"] else None, "seen_sl": {},
+            "target_sl": sl if self.p["sync_sl"] else None, "seen_sl": {},
             "max_members": 0, "be_stage": 0, "step": self.p["tp_step"],
+            "auto_sl": self.p["auto_sl"] if auto else 0,
         }
         self._broadcast(self._t("ladder_pending"), [
             f"{order['type']} {order['side']}  {self._lot_line(order['qty'], count, per, reduce)}",
             f"{self._t('price')}: {entry}",
             f"{self._t('tps')}: {', '.join(str(x) if x else '—' for x in levels)}",
+            f"{self._t('sl')}: {sl or '—'}" + (f" ({self._t('auto')})" if auto else ""),
         ])
 
     # ==================================================================
@@ -659,14 +677,23 @@ class LadderManager:
                 entry = parent["price"] if g["type"] == "limit" else parent["stop_price"]
                 if not self._same(entry, g["entry"]):
                     delta = entry - g["entry"]
+                    # an automatic SL keeps its distance from the order (set from the new price, so it is right
+                    # whether or not the terminal moved it too); the user's own SL stays where it is
+                    shift = lambda v: self._round(v + delta) if v else None
+                    dist = g["auto_sl"] if "auto_sl" in g else 0
+                    sign = 1 if g["side"] == "buy" else -1
+                    move_sl = (lambda v: self._round(entry - sign * dist)) if dist else (lambda v: v)
                     calls = []
                     for c in children:
                         params = {"price": entry} if g["type"] == "limit" else {"stopPrice": entry}
-                        params.update(self._order_prot(c["sl"], self._round(c["tp"] + delta) if c["tp"] else None))
+                        params.update(self._order_prot(move_sl(c["sl"]), shift(c["tp"])))
                         calls.append(self.pool.submit(self._modify_order, c["id"], params))
-                    if parent["tp"]:
-                        calls.append(self.pool.submit(self._modify_order, parent["id"],
-                                                      self._order_prot(parent["sl"], self._round(parent["tp"] + delta))))
+                    if parent["tp"] or dist:
+                        params = {"price": entry} if g["type"] == "limit" else {"stopPrice": entry}
+                        params.update(self._order_prot(move_sl(parent["sl"]), shift(parent["tp"])))
+                        calls.append(self.pool.submit(self._modify_order, parent["id"], params))
+                    if g["target_sl"]:
+                        g["target_sl"] = move_sl(g["target_sl"])
                     for c in calls:
                         c.result()
                     self._broadcast(self._t("pending_moved"), [f"{g['entry']} → {entry}"])
@@ -703,9 +730,12 @@ class LadderManager:
         else:
             attempts = 0
         try:
-            if target is None:
-                ok = self._protect(member, None, member["tp"])    # PATCH without stopLoss removes it
-                via = "clear"
+            if target is None and member["sl_id"] != "0":
+                ok = self._delete_order(member["sl_id"])     # a PATCH without stopLoss leaves the SL in place
+                via = "delete"
+            elif target is None:
+                ok = True
+                via = "none"
             elif attempts % 2 == 1 and member["sl_id"] != "0":
                 ok = self._modify_order(member["sl_id"], {"stopPrice": target})
                 via = "order"
