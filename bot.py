@@ -37,9 +37,22 @@ CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "lock_tp1_at",
             "sync_sl_delete", "auto_sl", "runner_keep_be", "step_every")
 
-# the 🔒 button cycles through these: (be_after_tp1, be_to, step_every)
-SL_MODES = [(False, "two_step", 1), (True, "two_step", 1), (True, "steps", 1), (True, "steps", 2),
-            (True, "tp1", 1), (True, "entry", 1)]
+# the 🔒 menu: (be_after_tp1, be_to, step_every), label, description (example: buy 4000, TP every 3$)
+SL_MODES = [
+    ((False, "two_step", 1), "כבוי", "הסטופ לא זז. כל עסקה נסגרת ב-TP שלה או בסטופ המקורי"),
+    ((True, "two_step", 1), "שני שלבים", "TP1 → סטופ לכניסה. חצי הדרך ל-TP2 → סטופ ל-TP1"),
+    ((True, "steps", 1), "🪜 מדרגה בכל TP", "כל TP הסטופ עולה מדרגה: TP1→כניסה, TP2→TP1, TP3→TP2…"),
+    ((True, "steps", 2), "🪜 מדרגה כל 2 TP", "TP2→כניסה, TP4→TP2, TP6→TP4… (יותר מקום לנשום)"),
+    ((True, "tp1", 1), "מיד ל-TP1", "TP1 נתפס → הסטופ של השאר ל-TP1"),
+    ((True, "entry", 1), "לכניסה", "TP1 נתפס → הסטופ של השאר לכניסה ונשאר שם"),
+]
+
+
+def sl_mode(p):
+    """The current (be_after_tp1, be_to, step_every) as it appears in SL_MODES."""
+    if not p["be_after_tp1"]:
+        return (False, "two_step", 1)
+    return (True, p["be_to"], p["step_every"] if p["be_to"] == "steps" else 1)
 
 
 def logins():
@@ -285,7 +298,8 @@ GUIDE = [
 ✂️ **חלוקה / שכפול** - עסקה של 0.10 לוט, 5 עסקאות:
   • **שכפול** → 5 × 0.10 = 0.50 לוט בסך הכול (50 אונקיות)
   • **חלוקה** → 5 × 0.02 = נשאר 0.10 לוט, מחולק לסולם
-🔒 **סטופ אחרי TP** - מה קורה לסטופ כשה-TP-ים נתפסים (פירוט בחלק הבא של המדריך). כל לחיצה עוברת למצב הבא.
+🔒 **סטופ אחרי TP** - מה קורה לסטופ כשה-TP-ים נתפסים (פירוט בחלק הבא של המדריך). \
+נפתח תפריט עם כל המצבים, המצב הנוכחי מסומן - בוחרים, והלוח מראה מה נבחר.
 🏃 **Runner** - העסקה האחרונה בלי TP (דלוק) או עם TP כמו כולן (כבוי).
 🚫 **מחיקת SL** - מחקת SL מעסקה אחת: נמחק מכולן, או שהמשכפל מחזיר לה את ה-SL.
 🎯 **Runner בכניסה** - במצבים "שני שלבים" ו"מיד ל-TP1": כשהשאר עוברות ל-TP1, ה-Runner נשאר בכניסה (סיכון 0, יותר מקום לרוץ). \
@@ -491,6 +505,28 @@ class AccountSelect(discord.ui.Select):
         await interaction.followup.send(f"✅ {self.panel.engine.name} עבר לחשבון {account_label(account)}", ephemeral=True)
 
 
+class SLModeSelect(discord.ui.Select):
+    """Private menu under the 🔒 button: every SL mode with what it does; the current one is preselected."""
+
+    def __init__(self, panel):
+        current = sl_mode(panel.engine.params)
+        options = [discord.SelectOption(label=label, description=desc, value=str(i), default=mode == current)
+                   for i, (mode, label, desc) in enumerate(SL_MODES)]
+        super().__init__(placeholder="בחר מה קורה לסטופ", options=options)
+        self.panel = panel
+
+    async def callback(self, interaction):
+        (on, to, every), label, _ = SL_MODES[int(self.values[0])]
+        engine = self.panel.engine
+        engine.set("be_to", to)
+        engine.set("step_every", every)
+        engine.set("be_after_tp1", on)
+        text = f"✅ סטופ אחרי TP: **{label}** - {after_tp1_text(engine.params)}"
+        engine.note(f"🔒 סטופ אחרי TP: {label} (השרת אישר)")
+        await interaction.response.edit_message(content=text, view=None)
+        await self.panel.refresh()
+
+
 class Panel(discord.ui.View):
     def __init__(self, bot, engine):
         super().__init__(timeout=None)
@@ -549,16 +585,11 @@ class Panel(discord.ui.View):
 
     @discord.ui.button(label="סטופ אחרי TP", emoji="🔒", style=discord.ButtonStyle.primary, custom_id="ladder:be", row=1)
     async def be(self, interaction, button):
-        # cycles: off -> two steps -> steps every TP -> steps every 2 TPs -> TP1 at once -> entry only -> off
-        p = self.engine.params
-        now = (p["be_after_tp1"], p["be_to"] if p["be_after_tp1"] else "two_step",
-               p["step_every"] if p["be_to"] == "steps" else 1)
-        i = SL_MODES.index(now) if now in SL_MODES else 0
-        on, to, every = SL_MODES[(i + 1) % len(SL_MODES)]
-        self.engine.set("be_to", to)
-        self.engine.set("step_every", every)
-        self.engine.set("be_after_tp1", on)
-        await self.confirm(interaction, "🔒 סטופ אחרי TP: " + after_tp1_text(p))
+        view = discord.ui.View(timeout=120)
+        view.add_item(SLModeSelect(self))
+        await interaction.response.send_message(
+            f"🔒 **מה יקרה לסטופ כשה-TP-ים נתפסים?**\nעכשיו: {after_tp1_text(self.engine.params)}",
+            view=view, ephemeral=True)
 
     @discord.ui.button(label="Runner", emoji="🏃", style=discord.ButtonStyle.primary, custom_id="ladder:runner", row=1)
     async def runner(self, interaction, button):
