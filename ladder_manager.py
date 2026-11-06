@@ -22,6 +22,7 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
    "steps": מדרגות - כל step_every רמות (TP) שהמחיר עבר, ה-SL של כולן (כולל ה-Runner) עולה מדרגה:
             step_every=1: TP1 -> כניסה + be_offset, TP2 -> TP1, TP3 -> TP2 ...
             step_every=2: TP2 -> כניסה + be_offset, TP4 -> TP2, TP6 -> TP4 ...
+            step_every=1, step_start=2: TP1 -> כלום, TP2 -> כניסה + be_offset, TP3 -> TP2, TP4 -> TP3 ...
             אחרי ה-TP האחרון ה-Runner ממשיך לעלות במדרגות לפי המחיר (כל tp_step נוסף).
    המחיר הנוכחי מגיע מה-PnL של העסקאות ב-stream (כל ~2 שניות); ב-polling שלב 2 רק כש-TP2 נתפס.
 
@@ -67,6 +68,7 @@ PARAMS = dict(
     be_after_tp1=False,         # אחרי TP1 - SL של השאר זז (לאן: be_to)
     be_to="two_step",           # "two_step" = כניסה ואז TP1 | "tp1" = SL למחיר TP1 | "entry" = SL לכניסה + be_offset | "steps" = מדרגות
     step_every=1,               # steps: כל כמה TP-ים ה-SL עולה מדרגה (1 = כל TP, 2 = כל שני TP-ים)
+    step_start=1,               # steps כל TP: באיזה TP הסטופ זז לכניסה (2 = כלום ב-TP1, TP2 -> כניסה, TP3 -> TP2 ...)
     be_offset=0.0,              # SL לכניסה: כמה מעבר לכניסה (0.3 = נועל 0.3$ רווח לאונקיה)
     lock_tp1_at=0.5,            # two_step: SL ל-TP1 כשהמחיר עבר את החלק הזה מהדרך TP1→TP2 (0.5 = חצי, 1 = TP2)
     runner_keep_be=True,        # כשה-SL של השאר עובר ל-TP1, ה-Runner נשאר בכניסה + be_offset (נותנים לו לרוץ בסיכון 0)
@@ -758,7 +760,8 @@ class LadderManager:
 
     def _move_steps(self, g, members, clear):
         """be_to="steps": every step_every levels reached, the SL of all of them (runner included) goes up one step -
-        level N reached -> SL to level N - step_every (level 0 = entry + be_offset, level k = TP k)."""
+        level N reached -> SL to level N - step_every (level 0 = entry + be_offset, level k = TP k).
+        step_every=1 with step_start=2: nothing at TP1, TP2 -> entry, then TP3 -> TP2, TP4 -> TP3 ..."""
         sign = 1 if g["side"] == "buy" else -1
         step = g["step"] if "step" in g else self.p["tp_step"]
         tp1 = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * step)
@@ -769,11 +772,12 @@ class LadderManager:
             # past the last TP only the runner is left: the price says how many levels it went
             reached = max(reached, int((marks[0] - tp1) * sign / step + 1e-9) + 1)
         level = reached // every * every
+        start = max(every, int(self.p["step_start"]) if every == 1 else every)
         done = g["step_level"] if "step_level" in g else 0
-        if level < every or level <= done:
+        if level < start or level <= done:
             return clear
         g["step_level"] = level
-        j = level - every
+        j = 0 if level == start else level - every
         sl = self._round(g["entry"] + sign * self.p["be_offset"]) if j == 0 else self._round(tp1 + sign * step * (j - 1))
         if g["target_sl"] is not None and (sl - g["target_sl"]) * sign <= 0:
             return clear

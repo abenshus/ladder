@@ -35,24 +35,27 @@ CONTROL_CHANNEL_ID = int(os.environ["CONTROL_CHANNEL_ID"])
 
 # what the panel may change; everything else stays as in lm.PARAMS
 EDITABLE = ("enabled", "mode", "copies", "tp_step", "runner_last", "be_after_tp1", "be_to", "be_offset", "lock_tp1_at",
-            "sync_sl_delete", "auto_sl", "runner_keep_be", "step_every")
+            "sync_sl_delete", "auto_sl", "runner_keep_be", "step_every", "step_start")
 
-# the 🔒 menu: (be_after_tp1, be_to, step_every), label, description (example: buy 4000, TP every 3$)
+# the 🔒 menu: (be_after_tp1, be_to, step_every, step_start), label, description (example: buy 4000, TP every 3$)
 SL_MODES = [
-    ((False, "two_step", 1), "כבוי", "הסטופ לא זז. כל עסקה נסגרת ב-TP שלה או בסטופ המקורי"),
-    ((True, "two_step", 1), "שני שלבים", "TP1 → סטופ לכניסה. חצי הדרך ל-TP2 → סטופ ל-TP1"),
-    ((True, "steps", 1), "🪜 מדרגה בכל TP", "כל TP הסטופ עולה מדרגה: TP1→כניסה, TP2→TP1, TP3→TP2…"),
-    ((True, "steps", 2), "🪜 מדרגה כל 2 TP", "TP2→כניסה, TP4→TP2, TP6→TP4… (יותר מקום לנשום)"),
-    ((True, "tp1", 1), "מיד ל-TP1", "TP1 נתפס → הסטופ של השאר ל-TP1"),
-    ((True, "entry", 1), "לכניסה", "TP1 נתפס → הסטופ של השאר לכניסה ונשאר שם"),
+    ((False, "two_step", 1, 1), "כבוי", "הסטופ לא זז. כל עסקה נסגרת ב-TP שלה או בסטופ המקורי"),
+    ((True, "two_step", 1, 1), "שני שלבים", "TP1 → סטופ לכניסה. חצי הדרך ל-TP2 → סטופ ל-TP1"),
+    ((True, "steps", 1, 1), "🪜 מדרגה בכל TP", "כל TP הסטופ עולה מדרגה: TP1→כניסה, TP2→TP1, TP3→TP2…"),
+    ((True, "steps", 1, 2), "🪜 כניסה ב-TP2, ואז מדרגה בכל TP", "TP1→כלום, TP2→כניסה, TP3→TP2, TP4→TP3…"),
+    ((True, "steps", 2, 1), "🪜 מדרגה כל 2 TP", "TP2→כניסה, TP4→TP2, TP6→TP4… (יותר מקום לנשום)"),
+    ((True, "tp1", 1, 1), "מיד ל-TP1", "TP1 נתפס → הסטופ של השאר ל-TP1"),
+    ((True, "entry", 1, 1), "לכניסה", "TP1 נתפס → הסטופ של השאר לכניסה ונשאר שם"),
 ]
 
 
 def sl_mode(p):
-    """The current (be_after_tp1, be_to, step_every) as it appears in SL_MODES."""
+    """The current (be_after_tp1, be_to, step_every, step_start) as it appears in SL_MODES."""
     if not p["be_after_tp1"]:
-        return (False, "two_step", 1)
-    return (True, p["be_to"], p["step_every"] if p["be_to"] == "steps" else 1)
+        return (False, "two_step", 1, 1)
+    if p["be_to"] != "steps":
+        return (True, p["be_to"], 1, 1)
+    return (True, "steps", p["step_every"], p["step_start"] if p["step_every"] == 1 else 1)
 
 
 def logins():
@@ -254,6 +257,9 @@ def list_accounts():
 def after_tp1_text(p):
     if not p["be_after_tp1"]:
         return "ה-SL לא זז"
+    if p["be_to"] == "steps" and p["step_every"] == 1 and p["step_start"] == 2:
+        return (f"מדרגות מ-TP2 - ב-TP1 ה-SL לא זז, TP2 → כניסה +{p['be_offset']:g}$, ואז כל TP ה-SL של כולן "
+                f"(כולל ה-Runner) עולה מדרגה: TP3 → TP2, TP4 → TP3…")
     if p["be_to"] == "steps" and p["step_every"] == 1:
         return f"מדרגות - כל TP ה-SL של כולן (כולל ה-Runner) עולה מדרגה: TP1 → כניסה +{p['be_offset']:g}$, TP2 → TP1, TP3 → TP2…"
     if p["be_to"] == "steps":
@@ -315,14 +321,18 @@ GUIDE = [
 4003 → SL **4000.5** · 4006 → SL **4003** · 4009 → SL **4006** · 4012 → SL **4009** · \
 ה-Runner ממשיך: 4015 → SL **4012**, 4018 → SL **4015**…
 
+**🪜 כניסה ב-TP2, ואז מדרגה בכל TP** - ב-TP1 לא זזים (נותנים לנשום), אחר כך צמוד:
+4003 → כלום · 4006 → SL **4000.5** · 4009 → SL **4006** · 4012 → SL **4009** · ה-Runner: 4015 → SL **4012**…
+
 **🪜 מדרגה כל 2 TP** - מחכים לשני TP-ים, ואז קופצים:
 4003 → כלום · 4006 → SL **4000.5** · 4009 → כלום · 4012 → SL **4006** · ה-Runner: 4018 → SL **4012**…
 
 **מיד ל-TP1** - TP1 נתפס → SL של השאר **4003** מיד.
 **לכניסה** - TP1 נתפס → SL של השאר **4000.5** ונשאר שם.
 
-**מה לבחור?** "מדרגה בכל TP" שומר יותר על הרווח: מעט עסקאות חוזרות להפסד, הרווח קטן יותר. \
-"מדרגה כל 2 TP" נותן לעסקה מקום לנשום: פחות עסקאות מרוויחות, אבל הרווח הממוצע גבוה יותר."""),
+**מה לבחור?** "מדרגה בכל TP" הכי שקט: אחרי TP1 כבר אין סיכון, אבל עסקאות שנוגעות ב-TP1, חוזרות לכניסה ורק אז רצות - נסגרות. \
+"כניסה ב-TP2, ואז מדרגה בכל TP" נותן לנשום עד TP2 ואז צמוד: פחות עסקאות מרוויחות (בין TP1 ל-TP2 הסטופ עוד מקורי), \
+אבל הרווח הממוצע הכי גבוה. "מדרגה כל 2 TP" באמצע."""),
 ]
 
 
@@ -516,10 +526,11 @@ class SLModeSelect(discord.ui.Select):
         self.panel = panel
 
     async def callback(self, interaction):
-        (on, to, every), label, _ = SL_MODES[int(self.values[0])]
+        (on, to, every, start), label, _ = SL_MODES[int(self.values[0])]
         engine = self.panel.engine
         engine.set("be_to", to)
         engine.set("step_every", every)
+        engine.set("step_start", start)
         engine.set("be_after_tp1", on)
         text = f"✅ סטופ אחרי TP: **{label}** - {after_tp1_text(engine.params)}"
         engine.note(f"🔒 סטופ אחרי TP: {label} (השרת אישר)")
