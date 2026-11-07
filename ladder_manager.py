@@ -39,6 +39,7 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -81,6 +82,7 @@ PARAMS = dict(
     label="",                   # שם שנוסף לכל הודעה בלוג (כמה משכפלים על אותו ערוץ)
     strategy_tag="LAD",         # strategyId של העסקאות שהשירות פותח
     manual_tags="",             # strategyId נוספים שנחשבים ידני, מופרדים בפסיק (בדיקות: key-undefined = API בלי strategy)
+    tp_hit_slack=0.3,           # עסקה שנעלמה נחשבת TP אם המחיר הכי טוב שנראה הגיע עד כדי כך ל-TP שלה (המחיר נדגם כל ~2 שניות)
     sl_retry_seconds=4.0,       # אם ה-SL לא התעדכן אחרי X שניות - מנסים שוב / דרך אחרת
 )
 
@@ -154,6 +156,7 @@ class StreamFeed:
         self.orders = {}        # oid -> merged OpenOrder events (modify events omit status)
         self.origin = {}        # pid -> order id that opened it
         self.filled = {}        # entry order id -> position id
+        self.tp_closed = {}     # position id -> time its TP (closing limit order) filled
         self.pnl = {}           # pid -> open PnL in USD (AccountStatus.positionPnLs)
 
     @property
@@ -232,6 +235,11 @@ class StreamFeed:
                 if order.get("status") == "STATUS_FILLED" and order.get("isOpen") and "positionId" in order:
                     self.filled[oid] = order["positionId"]
                     self.origin.setdefault(order["positionId"], oid)
+                if (order.get("status") == "STATUS_FILLED" and order.get("isOpen") is False
+                        and order.get("orderType") == "LIMIT" and "positionId" in order):
+                    now = time.time()
+                    self.tp_closed = {p: t for p, t in self.tp_closed.items() if now - t < 86400}
+                    self.tp_closed[str(order["positionId"])] = now
                 if order.get("status") in DONE_STATUSES:
                     del self.orders[oid]
             else:
@@ -766,11 +774,11 @@ class LadderManager:
         step = g["step"] if "step" in g else self.p["tp_step"]
         tp1 = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * step)
         every = max(1, int(self.p["step_every"]))
-        reached = g["max_members"] - len(members)          # TPs filled
-        marks = [m["mark"] for m in members if m["mark"] is not None]
-        if marks:
+        reached = self._tp_hits(g, members)
+        if "best" in g:
             # past the last TP only the runner is left: the price says how many levels it went
-            reached = max(reached, int((marks[0] - tp1) * sign / step + 1e-9) + 1)
+            # (floor, not int: a price between entry and TP1 is level 0, not 1)
+            reached = max(reached, math.floor((g["best"] - tp1) * sign / step + 1e-9) + 1)
         level = reached // every * every
         start = max(every, int(self.p["step_start"]) if every == 1 else every)
         done = g["step_level"] if "step_level" in g else 0
@@ -788,12 +796,36 @@ class LadderManager:
         self._broadcast(self._t("step_up"), [f"TP{level} → {self._t('sl')}: {sl}" + (" (BE)" if j == 0 else f" (TP{j})")])
         return False
 
+    def _track(self, g, members):
+        """Remember each member's TP and the best price the group has seen, so a trade that left can be told apart:
+        closed at its TP, or by hand / by its SL."""
+        if "tp_of" not in g:
+            g["tp_of"] = {}
+        for m in members:
+            if m["tp"] is not None:
+                g["tp_of"][m["id"]] = m["tp"]
+        sign = 1 if g["side"] == "buy" else -1
+        for m in members:
+            if m["mark"] is not None and ("best" not in g or (m["mark"] - g["best"]) * sign > 0):
+                g["best"] = m["mark"]
+
+    def _tp_hits(self, g, members):
+        """How many TPs filled. A member that is gone counts only if it had a TP and the price got there - closing a
+        trade by hand is not a TP. Without prices (polling) every member that left counts, as before."""
+        if "best" not in g:
+            return g["max_members"] - len(members)
+        sign = 1 if g["side"] == "buy" else -1
+        ids = [m["id"] for m in members]
+        closed = self.feed.tp_closed if self.feed else {}
+        return sum(1 for pid, tp in g["tp_of"].items()
+                   if pid not in ids and (pid in closed or (g["best"] - tp) * sign >= -self.p["tp_hit_slack"]))
+
     def _move_after_tp1(self, g, members, clear):
         """SL of the rest after TP1 (see be_to). Returns the group's clear flag."""
         if self.p["be_to"] == "steps":
             return self._move_steps(g, members, clear)
         stage = g["be_stage"] if "be_stage" in g else (2 if "be_done" in g and g["be_done"] else 0)
-        hits = g["max_members"] - len(members)
+        hits = self._tp_hits(g, members)
         if hits < 1 or stage == 2:
             return clear
         sign = 1 if g["side"] == "buy" else -1
@@ -847,6 +879,7 @@ class LadderManager:
                 self._broadcast(self._t("group_done"), [tag])
                 continue
             g["max_members"] = max(g["max_members"], len(members))
+            self._track(g, members)
             if "adopted" in g:
                 # taken over from an earlier run (restart, other machine): an SL set while nobody was managing the
                 # group counts as the user's - the most common one among the trades goes to all of them
