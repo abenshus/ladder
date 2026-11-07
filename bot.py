@@ -49,6 +49,86 @@ SL_MODES = [
 ]
 
 
+# a template = these settings, written as text in a window ("label: value" per line); loading one sets all of them
+TEMPLATE_FIELDS = [   # (label, key, kind)
+    ("עסקאות", "copies", "int"),
+    ("מרחק TP", "tp_step", "float"),
+    ("Runner", "runner_last", "bool"),
+    ("Runner בכניסה", "runner_keep_be", "bool"),
+    ("סטופ אוטומטי", "auto_sl", "float"),
+    ("BE offset", "be_offset", "float"),
+    ("נעילת TP1", "lock_tp1_at", "float"),
+    ("סטופ אחרי TP", "sl_mode", "mode"),
+]
+TEMPLATE_KEYS = ("copies", "tp_step", "runner_last", "runner_keep_be", "auto_sl", "be_offset", "lock_tp1_at",
+                 "be_after_tp1", "be_to", "step_every", "step_start")
+
+
+def template_text(p):
+    """The settings as the template window shows them, with the SL modes listed under it."""
+    lines = []
+    for label, key, kind in TEMPLATE_FIELDS:
+        if kind == "bool":
+            value = "כן" if p[key] else "לא"
+        elif kind == "mode":
+            value = next((str(i + 1) for i, (mode, _, _) in enumerate(SL_MODES) if mode == sl_mode(p)), "1")
+        else:
+            value = f"{p[key]:g}"
+        lines.append(f"{label}: {value}")
+    lines.append("# סטופ אחרי TP: " + " · ".join(f"{i + 1}={label.replace('🪜 ', '')}"
+                                               for i, (_, label, _) in enumerate(SL_MODES)))
+    return "\n".join(lines)
+
+
+def parse_template(text, base):
+    """Text from the template window -> settings (a line left out keeps base's value). Raises ValueError with why."""
+    labels = {label.replace(" ", "").lower(): (key, kind) for label, key, kind in TEMPLATE_FIELDS}
+    out = {k: base[k] for k in TEMPLATE_KEYS}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        sep = min([i for i in (line.find(":"), line.find("=")) if i >= 0], default=-1)
+        if sep < 0:
+            raise ValueError(f"שורה בלי ':' - {line}")
+        name, value = line[:sep].replace(" ", "").lower(), line[sep + 1:].strip()
+        if name not in labels:
+            raise ValueError(f"לא מכיר '{line[:sep].strip()}'")
+        key, kind = labels[name]
+        try:
+            if kind == "bool":
+                if value.lower() not in ("כן", "לא", "yes", "no", "1", "0"):
+                    raise ValueError
+                out[key] = value.lower() in ("כן", "yes", "1")
+            elif kind == "mode":
+                if int(value) < 1:
+                    raise ValueError
+                (out["be_after_tp1"], out["be_to"], out["step_every"], out["step_start"]), _, _ = SL_MODES[int(value) - 1]
+            elif kind == "int":
+                out[key] = int(value)
+            else:
+                out[key] = float(value)
+        except (ValueError, IndexError):
+            raise ValueError(f"ערך לא תקין ב-'{line[:sep].strip()}': {value}")
+    if not 2 <= out["copies"] <= 10:
+        raise ValueError("עסקאות: 2-10")
+    if not 0.1 <= out["tp_step"] <= 100:
+        raise ValueError("מרחק TP: 0.1-100")
+    if not 0 <= out["auto_sl"] <= 200:
+        raise ValueError("סטופ אוטומטי: 0-200")
+    if not 0 <= out["be_offset"] < out["tp_step"]:
+        raise ValueError("BE offset: בין 0 למרחק ה-TP")
+    if not 0 < out["lock_tp1_at"] <= 1:
+        raise ValueError("נעילת TP1: בין 0 ל-1")
+    return out
+
+
+def template_summary(t):
+    mode = next((label for mode, label, _ in SL_MODES if mode == sl_mode(t)), "")
+    return (f"{t['copies']} עסקאות · TP כל {t['tp_step']:g}$ · SL {t['auto_sl']:g}$ · {mode}"
+            + (" · Runner" if t["runner_last"] else ""))[:100]
+
+
 def sl_mode(p):
     """The current (be_after_tp1, be_to, step_every, step_start) as it appears in SL_MODES."""
     if not p["be_after_tp1"]:
@@ -91,7 +171,8 @@ def account_notes():
 class Settings:
     def __init__(self):
         # ladders: [{id, account, panel_message, params}]; limits: account -> max lots of a whole ladder (per account)
-        self.data = {"guide_message": 0, "header_message": 0, "ladders": [], "limits": {}}
+        # templates: name -> settings (TEMPLATE_KEYS), shared by all the ladders
+        self.data = {"guide_message": 0, "header_message": 0, "ladders": [], "limits": {}, "templates": {}}
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE) as f:
                 loaded = json.load(f)
@@ -212,6 +293,15 @@ class Engine:
         self.ladder["params"][key] = value
         self.settings.save()
 
+    def apply_template(self, name):
+        for key, value in self.settings.data["templates"][name].items():
+            self.set(key, value)
+
+    def template_name(self):
+        """The template the current settings match, if any."""
+        return next((name for name, t in self.settings.data["templates"].items()
+                     if all(key in self.params and self.params[key] == value for key, value in t.items())), None)
+
     def open_groups(self):
         if self.manager is None or self.manager.summary is None:
             return []
@@ -308,6 +398,9 @@ GUIDE = [
 נפתח תפריט עם כל המצבים, המצב הנוכחי מסומן - בוחרים, והלוח מראה מה נבחר.
 🏃 **Runner** - העסקה האחרונה בלי TP (דלוק) או עם TP כמו כולן (כבוי).
 🚫 **מחיקת SL** - מחקת SL מעסקה אחת: נמחק מכולן, או שהמשכפל מחזיר לה את ה-SL.
+📋 **תבניות** - שומרים את כל ההגדרות (עסקאות, מרחק TP, Runner, סטופים, מצב סטופ אחרי TP) בשם, \
+ואחר כך בוחרים תבנית מהרשימה וכל ההגדרות נטענות בבת אחת - למשל סקאלפ מהיר מול עסקה ארוכה. ➕ פותח חלון עם ההגדרות \
+הנוכחיות כטקסט (שורה לכל הגדרה) - משנים, נותנים שם ושומרים. עסקאות שכבר פתוחות ממשיכות עם ההגדרות שהן נפתחו איתן.
 🎯 **Runner בכניסה** - במצבים "שני שלבים" ו"מיד ל-TP1": כשהשאר עוברות ל-TP1, ה-Runner נשאר בכניסה (סיכון 0, יותר מקום לרוץ). \
 במצבי המדרגות ה-Runner תמיד עולה יחד עם כולן."""),
     ("🔒 מצבי הסטופ אחרי TP - בדוגמה של קנייה ב-4000", 0x95a5a6, """\
@@ -360,6 +453,7 @@ def panel_embed(engine):
         else "🔴 **כבוי** - לא משכפל עסקאות חדשות (קבוצות פתוחות ממשיכות לקבל סנכרון SL)",
         "",
         f"**חשבון:** {acc}" + (f"  ⚠️ {note}" if note else ""),
+        f"**תבנית:** {engine.template_name() or '— (הגדרות ידניות)'}",
         f"**מצב:** {'חלוקה (split) - הלוט שלך מתחלק' if p['mode'] == 'split' else 'שכפול (duplicate) - כל עסקה בלוט שלך'}",
         f"**עסקאות:** {p['copies']}",
         f"**מרחק בין TP-ים:** {p['tp_step']:g}$",
@@ -538,6 +632,110 @@ class SLModeSelect(discord.ui.Select):
         await self.panel.refresh()
 
 
+class TemplateModal(discord.ui.Modal):
+    """Write a template: a name and the settings as text, prefilled from the current settings (or the template edited)."""
+
+    def __init__(self, panel, old_name=None):
+        super().__init__(title="תבנית" + (f" · {old_name}" if old_name else " חדשה"))
+        self.panel = panel
+        self.old_name = old_name
+        templates = panel.settings.data["templates"]
+        source = dict(panel.engine.params, **templates[old_name]) if old_name else panel.engine.params
+        self.name = discord.ui.TextInput(label="שם התבנית", default=old_name or "", max_length=40,
+                                         placeholder="למשל: סקאלפ מהיר")
+        self.body = discord.ui.TextInput(label="הגדרות (שורה לכל הגדרה)", style=discord.TextStyle.paragraph,
+                                         default=template_text(source), max_length=1500)
+        self.add_item(self.name)
+        self.add_item(self.body)
+
+    async def on_submit(self, interaction):
+        name = self.name.value.strip()
+        templates = self.panel.settings.data["templates"]
+        try:
+            if not name:
+                raise ValueError("חסר שם")
+            t = parse_template(self.body.value, self.panel.engine.params)
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ התבנית לא נשמרה: {exc}", ephemeral=True)
+            return
+        if self.old_name and self.old_name != name and self.old_name in templates:
+            del templates[self.old_name]
+        templates[name] = t
+        self.panel.settings.save()
+        await self.panel.bot.render_all_panels()       # the "template" line of every panel may change
+        await interaction.response.send_message(
+            f"💾 תבנית **{name}** נשמרה: {template_summary(t)}\nכדי לטעון אותה: 📋 תבניות → בוחרים אותה.",
+            ephemeral=True, delete_after=30)
+
+
+class TemplateSelect(discord.ui.Select):
+    """Pick a template; action: load / edit / delete."""
+
+    def __init__(self, panel, action):
+        templates = panel.settings.data["templates"]
+        current = panel.engine.template_name()
+        options = [discord.SelectOption(label=name[:100], description=template_summary(t), value=name,
+                                        default=action == "load" and name == current)
+                   for name, t in list(templates.items())[:25]]
+        placeholder = {"load": "בחר תבנית לטעינה", "edit": "איזו תבנית לערוך?", "delete": "איזו תבנית למחוק?"}[action]
+        super().__init__(placeholder=placeholder, options=options)
+        self.panel = panel
+        self.action = action
+
+    async def callback(self, interaction):
+        name = self.values[0]
+        if name not in self.panel.settings.data["templates"]:
+            await interaction.response.edit_message(content="התבנית כבר לא קיימת.", view=None)
+            return
+        if self.action == "edit":
+            await interaction.response.send_modal(TemplateModal(self.panel, name))
+            return
+        if self.action == "delete":
+            del self.panel.settings.data["templates"][name]
+            self.panel.settings.save()
+            await interaction.response.edit_message(content=f"🗑 תבנית **{name}** נמחקה.", view=None)
+            await self.panel.bot.render_all_panels()
+            return
+        engine = self.panel.engine
+        engine.apply_template(name)
+        engine.note(f"📋 נטענה תבנית {name} (השרת אישר)")
+        await interaction.response.edit_message(
+            content=f"📋 נטענה תבנית **{name}**: {template_summary(engine.params)}\n"
+                    f"סטופ אחרי TP: {after_tp1_text(engine.params)}\n"
+                    "חל על העסקאות הבאות. עסקאות פתוחות ממשיכות עם ההגדרות שהן נפתחו איתן.", view=None)
+        await self.panel.refresh()
+
+
+class TemplateMenu(discord.ui.View):
+    """Private menu under 📋: the templates (choosing one loads it) and new / edit / delete."""
+
+    def __init__(self, panel):
+        super().__init__(timeout=180)
+        self.panel = panel
+        if panel.settings.data["templates"]:
+            self.add_item(TemplateSelect(panel, "load"))
+        else:
+            self.remove_item(self.edit)
+            self.remove_item(self.delete)
+
+    async def _pick(self, interaction, action):
+        view = discord.ui.View(timeout=120)
+        view.add_item(TemplateSelect(self.panel, action))
+        await interaction.response.edit_message(content=None, view=view)
+
+    @discord.ui.button(label="תבנית חדשה", emoji="➕", style=discord.ButtonStyle.success, row=1)
+    async def new(self, interaction, button):
+        await interaction.response.send_modal(TemplateModal(self.panel))
+
+    @discord.ui.button(label="ערוך", emoji="✏️", style=discord.ButtonStyle.secondary, row=1)
+    async def edit(self, interaction, button):
+        await self._pick(interaction, "edit")
+
+    @discord.ui.button(label="מחק", emoji="🗑", style=discord.ButtonStyle.danger, row=1)
+    async def delete(self, interaction, button):
+        await self._pick(interaction, "delete")
+
+
 class Panel(discord.ui.View):
     def __init__(self, bot, engine):
         super().__init__(timeout=None)
@@ -619,6 +817,16 @@ class Panel(discord.ui.View):
         await self._toggle(interaction, "runner_keep_be", new,
                            "🎯 Runner: " + ("ה-SL שלו נשאר בכניסה כשהשאר עוברות ל-TP1" if new
                                            else "עובר ל-TP1 יחד עם השאר"))
+
+    @discord.ui.button(label="תבניות", emoji="📋", style=discord.ButtonStyle.success, custom_id="ladder:tpl", row=3)
+    async def templates(self, interaction, button):
+        templates = self.settings.data["templates"]
+        current = self.engine.template_name()
+        text = ("📋 **תבניות** - בוחרים תבנית וכל ההגדרות נטענות." if templates
+                else "📋 **אין עדיין תבניות.** ➕ פותח חלון עם ההגדרות הנוכחיות - משנים, נותנים שם ושומרים.")
+        if templates:
+            text += f"\nעכשיו: {current or 'הגדרות ידניות (לא תואם לאף תבנית)'}"
+        await interaction.response.send_message(text, view=TemplateMenu(self), ephemeral=True)
 
     async def switch(self, account):
         self.engine.ladder["account"] = account
@@ -803,6 +1011,10 @@ class LadderBot(discord.Client):
             msg = await channel.send(embed=embed, view=view)
             engine.ladder["panel_message"] = msg.id
             self.settings.save()
+
+    async def render_all_panels(self):
+        for engine in self.engines:
+            await self.render_panel(engine)
 
     async def add_ladder(self):
         engine = Engine(self.settings, self.settings.new_ladder())

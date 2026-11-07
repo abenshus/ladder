@@ -24,6 +24,7 @@ Ladder Manager - שירות שרץ מחוץ ל-TradeLocker (Mac / Hetzner) ומ�
             step_every=2: TP2 -> כניסה + be_offset, TP4 -> TP2, TP6 -> TP4 ...
             step_every=1, step_start=2: TP1 -> כלום, TP2 -> כניסה + be_offset, TP3 -> TP2, TP4 -> TP3 ...
             אחרי ה-TP האחרון ה-Runner ממשיך לעלות במדרגות לפי המחיר (כל tp_step נוסף).
+   קבוצה שומרת את הגדרות ה-SL שהיא נפתחה איתן (GROUP_KEYS) - שינוי / טעינת תבנית חלים על העסקאות הבאות.
    המחיר הנוכחי מגיע מה-PnL של העסקאות ב-stream (כל ~2 שניות); ב-polling שלב 2 רק כש-TP2 נתפס.
 
 עסקאות של בוטים אחרים (strategyId לא ריק, למשל HGUARD) לא נוגעים בהן.
@@ -124,6 +125,10 @@ TRANSLATIONS = {
 }
 
 log = logging.getLogger("ladder")
+
+# SL management settings a group keeps from the moment it opens: changing them (or loading a template) applies to the
+# next trades, an open ladder goes on with the rules it started with
+GROUP_KEYS = ("be_after_tp1", "be_to", "step_every", "step_start", "be_offset", "lock_tp1_at", "runner_keep_be")
 
 
 def env_login(prefix="TL_"):
@@ -305,6 +310,10 @@ class LadderManager:
     def _t(self, key):
         lang = self.p["language"] if self.p["language"] in TRANSLATIONS else "he"
         return TRANSLATIONS[lang][key]
+
+    def _c(self, g, key):
+        """A group's own SL setting (see GROUP_KEYS); groups from before it was kept use the current one."""
+        return g["cfg"][key] if "cfg" in g and key in g["cfg"] else self.p[key]
 
     def _round(self, price):
         return round(float(price), self.p["price_decimals"])
@@ -621,7 +630,7 @@ class LadderManager:
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
             "target_sl": sl if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
-            "tp1": levels[0], "step": self.p["tp_step"],
+            "tp1": levels[0], "step": self.p["tp_step"], "cfg": {k: self.p[k] for k in GROUP_KEYS},
         }
         self._broadcast(self._t("ladder"), [
             f"{self._t('side')}: {pos['side']}  {self._lot_line(pos['qty'], count, per, reduce, opened)}",
@@ -673,8 +682,8 @@ class LadderManager:
             "kind": "pending", "side": order["side"], "entry": entry, "parent_order": order["id"],
             "type": order["type"],
             "target_sl": sl if self.p["sync_sl"] else None, "seen_sl": {},
-            "max_members": 0, "be_stage": 0, "step": self.p["tp_step"],
-            "auto_sl": self.p["auto_sl"] if auto else 0,
+            "max_members": 0, "be_stage": 0, "step": self.p["tp_step"], "tp1": tp1,
+            "auto_sl": self.p["auto_sl"] if auto else 0, "cfg": {k: self.p[k] for k in GROUP_KEYS},
         }
         self._broadcast(self._t("ladder_pending"), [
             f"{order['type']} {order['side']}  {self._lot_line(order['qty'], count, per, reduce)}",
@@ -713,6 +722,8 @@ class LadderManager:
                         calls.append(self.pool.submit(self._modify_order, parent["id"], params))
                     if g["target_sl"]:
                         g["target_sl"] = move_sl(g["target_sl"])
+                    if "tp1" in g and g["tp1"]:
+                        g["tp1"] = shift(g["tp1"])      # the TPs moved with the order
                     for c in calls:
                         c.result()
                     self._broadcast(self._t("pending_moved"), [f"{g['entry']} → {entry}"])
@@ -773,20 +784,20 @@ class LadderManager:
         sign = 1 if g["side"] == "buy" else -1
         step = g["step"] if "step" in g else self.p["tp_step"]
         tp1 = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * step)
-        every = max(1, int(self.p["step_every"]))
+        every = max(1, int(self._c(g, "step_every")))
         reached = self._tp_hits(g, members)
         if "best" in g:
             # past the last TP only the runner is left: the price says how many levels it went
             # (floor, not int: a price between entry and TP1 is level 0, not 1)
             reached = max(reached, math.floor((g["best"] - tp1) * sign / step + 1e-9) + 1)
         level = reached // every * every
-        start = max(every, int(self.p["step_start"]) if every == 1 else every)
+        start = max(every, int(self._c(g, "step_start")) if every == 1 else every)
         done = g["step_level"] if "step_level" in g else 0
         if level < start or level <= done:
             return clear
         g["step_level"] = level
         j = 0 if level == start else level - every
-        sl = self._round(g["entry"] + sign * self.p["be_offset"]) if j == 0 else self._round(tp1 + sign * step * (j - 1))
+        sl = self._round(g["entry"] + sign * self._c(g, "be_offset")) if j == 0 else self._round(tp1 + sign * step * (j - 1))
         if g["target_sl"] is not None and (sl - g["target_sl"]) * sign <= 0:
             return clear
         if "runner_sl" in g:
@@ -822,7 +833,8 @@ class LadderManager:
 
     def _move_after_tp1(self, g, members, clear):
         """SL of the rest after TP1 (see be_to). Returns the group's clear flag."""
-        if self.p["be_to"] == "steps":
+        be_to = self._c(g, "be_to")
+        if be_to == "steps":
             return self._move_steps(g, members, clear)
         stage = g["be_stage"] if "be_stage" in g else (2 if "be_done" in g and g["be_done"] else 0)
         hits = self._tp_hits(g, members)
@@ -832,23 +844,23 @@ class LadderManager:
         step = g["step"] if "step" in g else self.p["tp_step"]
         # the TP1 the ladder opened with; a filled pending group's entry is the fill price
         tp1 = g["tp1"] if "tp1" in g and g["tp1"] else self._round(g["entry"] + sign * step)
-        entry_sl = self._round(g["entry"] + sign * self.p["be_offset"])
+        entry_sl = self._round(g["entry"] + sign * self._c(g, "be_offset"))
         header, be = None, None
-        if self.p["be_to"] == "two_step":
-            trigger = tp1 + sign * step * self.p["lock_tp1_at"]
-            marks = [m["mark"] for m in members if m["mark"] is not None]
-            ran_on = bool(marks) and (marks[0] - trigger) * sign >= 0
+        if be_to == "two_step":
+            trigger = tp1 + sign * step * self._c(g, "lock_tp1_at")
+            # the best price seen, not just the latest: a spike to the trigger between two samples still counts
+            ran_on = "best" in g and (g["best"] - trigger) * sign >= 0
             if hits >= 2 or ran_on:
                 header, be, stage = "lock_tp1", tp1, 2
             elif stage == 0:
                 header, be, stage = "be", entry_sl, 1
         else:
-            header, be, stage = "be", tp1 if self.p["be_to"] == "tp1" else entry_sl, 2
+            header, be, stage = "be", tp1 if be_to == "tp1" else entry_sl, 2
         g["be_stage"] = stage
         if be is None or not (g["target_sl"] is None or (be - g["target_sl"]) * sign > 0):
             return clear
         lines = [f"{self._t('sl')}: {be}"]
-        if self.p["runner_keep_be"] and not self._same(be, entry_sl) and any(m["tp"] is None for m in members):
+        if self._c(g, "runner_keep_be") and not self._same(be, entry_sl) and any(m["tp"] is None for m in members):
             # the runner keeps the entry SL (or a better one it already had) so one trade rides the whole move
             keep = g["target_sl"] if g["target_sl"] is not None and (g["target_sl"] - entry_sl) * sign > 0 else entry_sl
             g["runner_sl"] = keep
@@ -914,7 +926,7 @@ class LadderManager:
                     g["clear_sl"] = clear = True
                     self._broadcast(self._t("sl_cleared"), [f"{self._t('count')}: {len(members)}"])
 
-            if self.p["be_after_tp1"] and g["max_members"] >= 2:
+            if self._c(g, "be_after_tp1") and g["max_members"] >= 2:
                 clear = self._move_after_tp1(g, members, clear)
 
             if g["target_sl"] is not None or clear:
