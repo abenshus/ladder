@@ -155,11 +155,16 @@ def news_spec(n):
         at = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         if at + timedelta(minutes=n["expire_min"]) < now:
             raise ValueError(f"השעה {n['news_time']} כבר עברה - עדכן את שעת החדשה בהגדרות")
+        if at - timedelta(seconds=60) < now:
+            raise ValueError(f"פחות מדקה ל-{n['news_time']} - מאוחר מדי לשגר: ההצבה לוקחת כמה שניות, והפקודות היו "
+                             "יוצאות באמצע הספייק (כמו ב-10/11 15:30)")
+        deadline = (at - timedelta(seconds=5)).timestamp()
     else:
         at = now
+        deadline = None
     return dict(sides=SIDES[n["sides"]], levels=levels, trades=int(n["trades"]), sl=float(n["sl"]), slip=float(n["slip"]),
                 risk_pct=float(n["risk_pct"]), runner=bool(n["runner"]),
-                expire_at=(at + timedelta(minutes=n["expire_min"])).timestamp(),
+                expire_at=(at + timedelta(minutes=n["expire_min"])).timestamp(), deadline=deadline,
                 cfg=dict(be_after_tp1=on, be_to=to, step_every=every, step_start=start))
 
 
@@ -967,6 +972,7 @@ class NewsBlock(discord.ui.View):
         live = split_key(engine.account)[0] == "live"
         until = datetime.fromtimestamp(spec["expire_at"], IL).strftime("%H:%M")
         head = (f"⚠️ **{account_label(engine.account)} - כסף אמיתי.**\n" if live else "") + \
+            ("" if self.params["news_time"] else "⚠️ **לא נקבעה שעת חדשה** - אין הגנה משיגור מאוחר. קבע אותה ב-⚙️.\n") + \
             f"🚀 **לשגר על {account_label(engine.account)}?** (ביטול של מה שלא נתפס ב-{until})\n" + \
             f"ההצבה לוקחת כ-{max(5, len(plan['levels']) * plan['trades'] // 4)} שניות - לשגר כמה דקות לפני החדשה.\n"
         await interaction.followup.send(head + plan_text(plan, self.params), view=ConfirmLaunch(self, engine), ephemeral=True)

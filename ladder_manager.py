@@ -105,6 +105,7 @@ TRANSLATIONS = {
         "news_placed": "📰 <b>פקודות חדשות הוצבו</b>",
         "news_expired": "⌛ <b>פקודות חדשות לא נתפסו - בוטלו</b>",
         "news_cancel": "🗑 <b>פקודות חדשות בוטלו</b>",
+        "news_slip": "📉 <b>פקודת חדשות נתפסה רחוק מהמחיר שלה</b>",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
         "auto": "אוטומטי", "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
@@ -125,6 +126,7 @@ TRANSLATIONS = {
         "news_placed": "📰 <b>News orders placed</b>",
         "news_expired": "⌛ <b>News orders not filled - cancelled</b>",
         "news_cancel": "🗑 <b>News orders cancelled</b>",
+        "news_slip": "📉 <b>News order filled far from its price</b>",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
         "auto": "auto", "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
@@ -752,11 +754,14 @@ class LadderManager:
             else:
                 pos_id = self.api.get_position_id_from_order_id(int(g["parent_order"]))
             if pos_id and str(pos_id) in positions:
+                level = g["entry"]
                 g["kind"] = "open"
                 g["parent"] = str(pos_id)
                 g["entry"] = positions[str(pos_id)]["price"]
                 self.state["seen_positions"].append(str(pos_id))
                 self._broadcast(self._t("pending_filled"), [f"{self._t('price')}: {g['entry']}"])
+                if "news" in g:
+                    self._news_rebase(g, level)
             else:
                 for c in [self.pool.submit(self._delete_order, c["id"]) for c in children]:
                     c.result()
@@ -838,14 +843,36 @@ class LadderManager:
 
     def _tp_hits(self, g, members):
         """How many TPs filled. A member that is gone counts only if it had a TP and the price got there - closing a
-        trade by hand is not a TP. Without prices (polling) every member that left counts, as before."""
+        trade by hand is not a TP. Without prices (polling) every member that left counts, as before.
+        TPs a news order's fill had already passed (they close at once at the market) are not progress: skip_hits."""
+        skip = g["skip_hits"] if "skip_hits" in g else 0
         if "best" not in g:
-            return g["max_members"] - len(members)
+            return max(0, g["max_members"] - len(members) - skip)
         sign = 1 if g["side"] == "buy" else -1
         ids = [m["id"] for m in members]
         closed = self.feed.tp_closed if self.feed else {}
-        return sum(1 for pid, tp in g["tp_of"].items()
+        hits = sum(1 for pid, tp in g["tp_of"].items()
                    if pid not in ids and (pid in closed or (g["best"] - tp) * sign >= -self.p["tp_hit_slack"]))
+        return max(0, hits - skip)
+
+    def _news_rebase(self, g, level):
+        """A news stop that filled far past its level (a gap in the spike, 10/11 15:30: sell stop 4062.61 filled at
+        4043.67): its TPs already passed close at once at the market, so the SL steps count from the real fill
+        (TP1 = fill + step) and the SL keeps its planned distance from the fill instead of from the level."""
+        if "news_slip" not in g:
+            return
+        sign = 1 if g["side"] == "buy" else -1
+        slip = (g["entry"] - level) * sign
+        if slip <= g["news_slip"]:
+            return
+        g["skip_hits"] = int(slip / g["step"] + 1e-9)
+        g["tp1"] = self._round(g["entry"] + sign * g["step"])
+        tighter = self._round(g["entry"] - sign * g["news_sl"])
+        if g["target_sl"] is None or (tighter - g["target_sl"]) * sign > 0:
+            g["target_sl"] = tighter
+        self._broadcast(self._t("news_slip"), [
+            f"{g['side']} נתפס ב-{g['entry']} במקום {level} (החלקה {slip:.2f}$)",
+            f"{g['skip_hits']} TP-ים כבר היו מאחור ונסגרים במחיר השוק · המדרגות נספרות מהמילוי · SL {g['target_sl']}"])
 
     def _move_after_tp1(self, g, members, clear):
         """SL of the rest after TP1 (see be_to). Returns the group's clear flag."""
@@ -1022,20 +1049,34 @@ class LadderManager:
                     raise
                 time.sleep(1.5 * (attempt + 1))
 
+    def _news_order(self, deadline, *args):
+        """One news order, not sent once the release is a few seconds away (it would go out during the spike)."""
+        if deadline and time.time() > deadline:
+            raise RuntimeError("לא נשלחה - החדשה בעוד פחות מ-5 שניות")
+        return self._retry_429(self._pending, *args)
+
     def _news_launch(self, spec):
         plan = self.news_plan(spec)
         if not plan["ok"]:
             raise RuntimeError(plan["reason"])
+        deadline = spec["deadline"] if "deadline" in spec else None
+        if deadline and time.time() > deadline:
+            raise RuntimeError("מאוחר מדי - החדשה עוד רגע/כבר יצאה, ההצבה לוקחת שניות והמחיר יזוז באמצע")
         stamp = int(time.time()) % 1000000
         lines, errors = [], []
         for i, lv in enumerate(plan["levels"]):
             s = 1 if lv["side"] == "buy" else -1
             tag = f"{self.p['strategy_tag']}-N{stamp}{lv['side'][0].upper()}{i}"
+            # a stop the market already passed fills at once, far from its price: leave that level out
+            px = self.api.get_latest_asking_price(self.instr_id) if s > 0 else self.api.get_latest_bid_price(self.instr_id)
+            if (px - lv["entry"]) * s >= -0.5:
+                lines.append(f"{lv['side']} stop {lv['entry']} · לא הוצב - המחיר כבר {px}")
+                continue
             tps = [self._round(lv["entry"] + s * lv["step"] * (k + 1)) for k in range(plan["trades"])]
             if spec["runner"]:
                 tps[-1] = None
             src = {"side": lv["side"], "type": "stop", "price": 0.0, "stop_price": lv["entry"]}
-            futures = [self.pool.submit(self._retry_429, self._pending, src, plan["lot"], tp, lv["sl"], tag) for tp in tps]
+            futures = [self.pool.submit(self._news_order, deadline, src, plan["lot"], tp, lv["sl"], tag) for tp in tps]
             ids = []
             for f in futures:
                 try:
@@ -1049,6 +1090,7 @@ class LadderManager:
                     "kind": "pending", "side": lv["side"], "entry": lv["entry"], "parent_order": ids[0], "type": "stop",
                     "target_sl": lv["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
                     "step": lv["step"], "tp1": tps[0], "auto_sl": 0, "news": True, "expire_at": spec["expire_at"],
+                    "news_sl": spec["sl"], "news_slip": spec["slip"],
                     "cfg": dict({k: self.p[k] for k in GROUP_KEYS}, **spec["cfg"]),
                 }
             lines.append(f"{lv['side']} stop {lv['entry']} · {len(ids)}/{len(tps)} × {plan['lot']} · TP כל {lv['step']:g}$ · SL {lv['sl']}")
