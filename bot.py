@@ -837,7 +837,9 @@ class NewsModal(discord.ui.Modal):
 class NewsAccountSelect(discord.ui.Select):
     def __init__(self, block):
         engines = [e for e in block.bot.engines if e.account]
-        options = [discord.SelectOption(label=f"{account_label(e.account)} · {e.name}"[:100], value=e.account,
+        notes = account_notes()
+        note = lambda acc: f" ⚠️ {notes[split_key(acc)[1]]}" if split_key(acc)[1] in notes else ""
+        options = [discord.SelectOption(label=f"{account_label(e.account)} · {e.name}{note(e.account)}"[:100], value=e.account,
                                         default=e.account == block.data["account"]) for e in engines][:25]
         if not options:
             options = [discord.SelectOption(label="אין משכפל עם חשבון - בחר חשבון במשכפל קודם", value="none")]
