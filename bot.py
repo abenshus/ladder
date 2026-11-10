@@ -155,8 +155,8 @@ def news_spec(n):
         at = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         if at + timedelta(minutes=n["expire_min"]) < now:
             raise ValueError(f"השעה {n['news_time']} כבר עברה - עדכן את שעת החדשה בהגדרות")
-        if at - timedelta(seconds=60) < now:
-            raise ValueError(f"פחות מדקה ל-{n['news_time']} - מאוחר מדי לשגר: ההצבה לוקחת כמה שניות, והפקודות היו "
+        if at - timedelta(seconds=30) < now:     # the price swings before the release: launch late, but not too late
+            raise ValueError(f"פחות מחצי דקה ל-{n['news_time']} - מאוחר מדי לשגר: ההצבה לוקחת כמה שניות, והפקודות היו "
                              "יוצאות באמצע הספייק (כמו ב-10/11 15:30)")
         deadline = (at - timedelta(seconds=5)).timestamp()
     else:
