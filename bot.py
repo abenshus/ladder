@@ -20,6 +20,8 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 import requests
@@ -129,6 +131,49 @@ def template_summary(t):
             + (" · Runner" if t["runner_last"] else ""))[:100]
 
 
+# the news block: stop orders on both sides placed in advance, each one a ladder (defaults = what the backtest liked:
+# 10$ away TP every 1.5$, 15$ away TP every 3$, SL 10, BE at TP2 then a step every TP, cancelled 2 min after the release)
+NEWS_DEFAULTS = dict(sides="שניהם", levels="10:1.5, 15:3", trades=10, sl=10.0, slip=2.0, risk_pct=50.0,
+                     news_time="", expire_min=2.0, sl_mode=4, runner=True)
+IL = ZoneInfo("Asia/Jerusalem")
+SIDES = {"שניהם": [1, -1], "קנייה": [1], "מכירה": [-1]}
+
+
+def news_spec(n):
+    """The news block's settings -> what the ladder manager needs (raises ValueError with why)."""
+    levels = []
+    for part in n["levels"].replace(" ", "").split(","):
+        dist, step = part.split(":")
+        levels.append([float(dist), float(step)])
+    if not levels or any(not 1 <= d <= 100 or not 0.1 <= st <= 50 for d, st in levels):
+        raise ValueError("רמות: מרחק 1-100, TP 0.1-50, למשל 10:1.5, 15:3")
+    (on, to, every, start), _, _ = SL_MODES[int(n["sl_mode"]) - 1]
+    now = datetime.now(IL)
+    if n["news_time"]:
+        hh, mm = n["news_time"].split(":")
+        at = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        if at + timedelta(minutes=n["expire_min"]) < now:
+            raise ValueError(f"השעה {n['news_time']} כבר עברה - עדכן את שעת החדשה בהגדרות")
+    else:
+        at = now
+    return dict(sides=SIDES[n["sides"]], levels=levels, trades=int(n["trades"]), sl=float(n["sl"]), slip=float(n["slip"]),
+                risk_pct=float(n["risk_pct"]), runner=bool(n["runner"]),
+                expire_at=(at + timedelta(minutes=n["expire_min"])).timestamp(),
+                cfg=dict(be_after_tp1=on, be_to=to, step_every=every, step_start=start))
+
+
+def plan_text(plan, n):
+    lines = [f"**חשבון:** יתרה {plan['balance']:,.2f}$ · פנוי {plan['free']:,.2f}$ · מינוף 1:{plan['leverage']:g} · מחיר עכשיו {plan['price']}",
+             f"**גודל:** {plan['trades']} עסקאות × {plan['lot']} לכל רמה" + (f" ({plan['reason']})" if plan["reason"] else ""),
+             f"**סיכון מקסימלי:** {plan['risk']:,.0f}$ ({plan['risk'] / plan['balance'] * 100:.0f}% מהיתרה) - אם בכל צד רמה שלמה "
+             f"נתפסת ונסגרת בסטופ עם החלקה של {n['slip']:g}$",
+             f"**מרווח לרמה:** {plan['margin']:,.0f}$"]
+    for lv in plan["levels"]:
+        lines.append(f"• {'קנייה' if lv['side'] == 'buy' else 'מכירה'} Stop **{lv['entry']}** · TP כל {lv['step']:g}$ "
+                     f"({lv['tp1']} … {lv['last']}{' + Runner' if n['runner'] else ''}) · SL {lv['sl']}")
+    return "\n".join(lines)
+
+
 def sl_mode(p):
     """The current (be_after_tp1, be_to, step_every, step_start) as it appears in SL_MODES."""
     if not p["be_after_tp1"]:
@@ -172,7 +217,8 @@ class Settings:
     def __init__(self):
         # ladders: [{id, account, panel_message, params}]; limits: account -> max lots of a whole ladder (per account)
         # templates: name -> settings (TEMPLATE_KEYS), shared by all the ladders
-        self.data = {"guide_message": 0, "header_message": 0, "ladders": [], "limits": {}, "templates": {}}
+        self.data = {"guide_message": 0, "header_message": 0, "ladders": [], "limits": {}, "templates": {},
+                     "news": {"account": "", "message": 0, "params": dict(NEWS_DEFAULTS)}}
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE) as f:
                 loaded = json.load(f)
@@ -182,6 +228,8 @@ class Settings:
                                       "panel_message": loaded.pop("panel_message", 0),
                                       "params": loaded.pop("params", {"enabled": False})}]
             self.data.update(loaded)
+            for key, value in NEWS_DEFAULTS.items():        # settings added after the block was first saved
+                self.data["news"]["params"].setdefault(key, value)
         if not self.data["ladders"]:
             self.new_ladder(os.environ.get("TL_ACCOUNT_ID", ""))
 
@@ -225,6 +273,9 @@ class Engine:
     @property
     def name(self):
         return f"משכפל {self.lid}"
+
+    def news_groups(self):
+        return [g for g in self.open_groups() if g["news"]]
 
     @property
     def account(self):
@@ -401,6 +452,9 @@ GUIDE = [
 📋 **תבניות** - שומרים את כל ההגדרות (עסקאות, מרחק TP, Runner, סטופים, מצב סטופ אחרי TP) בשם, \
 ואחר כך בוחרים תבנית מהרשימה וכל ההגדרות נטענות בבת אחת - למשל סקאלפ מהיר מול עסקה ארוכה. ➕ פותח חלון עם ההגדרות \
 הנוכחיות כטקסט (שורה לכל הגדרה) - משנים, נותנים שם ושומרים. עסקאות שכבר פתוחות ממשיכות עם ההגדרות שהן נפתחו איתן.
+📰 **בלוק חדשות** (בסוף הערוץ) - בוחרים חשבון שרץ עליו משכפל, ⚙️ שעת החדשה והגדרות, 🔍 תצוגה מקדימה, 🚀 שגר. \
+הוא שם פקודות Stop לשני הכיוונים (ברירת מחדל 10$ ו-15$ מהמחיר), כל אחת סולם עם TP-ים משלה, מחשב את הגודל לפי היתרה, \
+המינוף והסיכון שבחרת, ומבטל מה שלא נתפס 2 דקות אחרי החדשה.
 🎯 **Runner בכניסה** - במצבים "שני שלבים" ו"מיד ל-TP1": כשהשאר עוברות ל-TP1, ה-Runner נשאר בכניסה (סיכון 0, יותר מקום לרוץ). \
 במצבי המדרגות ה-Runner תמיד עולה יחד עם כולן."""),
     ("🔒 מצבי הסטופ אחרי TP - בדוגמה של קנייה ב-4000", 0x95a5a6, """\
@@ -736,6 +790,223 @@ class TemplateMenu(discord.ui.View):
         await self._pick(interaction, "delete")
 
 
+class NewsModal(discord.ui.Modal):
+    def __init__(self, block):
+        super().__init__(title="הגדרות חדשות")
+        self.block = block
+        n = block.params
+        self.when = discord.ui.TextInput(label="שעת החדשה (שעון ישראל) / ביטול אחרי דקות", default=f"{n['news_time']} / {n['expire_min']:g}",
+                                         placeholder="15:30 / 2   (בלי שעה = מרגע השיגור)", max_length=20)
+        self.levels = discord.ui.TextInput(label="רמות - מרחק מהמחיר:TP כל, מופרד בפסיק", default=n["levels"], max_length=60)
+        self.size = discord.ui.TextInput(label="עסקאות לרמה / SL $ / החלקה $", default=f"{n['trades']} / {n['sl']:g} / {n['slip']:g}",
+                                         max_length=20)
+        self.risk = discord.ui.TextInput(label="סיכון מקסימלי - % מהיתרה", default=f"{n['risk_pct']:g}", max_length=5)
+        self.side = discord.ui.TextInput(label="כיוון / סטופ אחרי TP 1-7 / Runner", placeholder="שניהם|קנייה|מכירה / 4 / כן",
+                                         default=f"{n['sides']} / {n['sl_mode']} / {'כן' if n['runner'] else 'לא'}", max_length=30)
+        for item in (self.when, self.levels, self.size, self.risk, self.side):
+            self.add_item(item)
+
+    async def on_submit(self, interaction):
+        try:
+            when = [x.strip() for x in self.when.value.split("/")]
+            size = [x.strip() for x in self.size.value.split("/")]
+            side = [x.strip() for x in self.side.value.split("/")]
+            new = dict(self.block.params, news_time=when[0], expire_min=float(when[1]) if len(when) > 1 else 2.0,
+                       levels=self.levels.value.strip(), trades=int(size[0]), sl=float(size[1]), slip=float(size[2]),
+                       risk_pct=float(self.risk.value), sides=side[0], sl_mode=int(side[1]), runner=side[2] in ("כן", "yes", "1"))
+            if new["sides"] not in SIDES or not 1 <= new["sl_mode"] <= len(SL_MODES) or not 2 <= new["trades"] <= 30 \
+                    or not 1 <= new["sl"] <= 100 or not 0 <= new["slip"] <= 20 or not 1 <= new["risk_pct"] <= 100 \
+                    or not 0.5 <= new["expire_min"] <= 120:
+                raise ValueError
+            if new["news_time"]:
+                hh, mm = new["news_time"].split(":")
+                if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+                    raise ValueError
+            news_spec(dict(new, news_time=""))       # checks the levels
+        except (ValueError, IndexError):
+            await interaction.response.send_message(
+                "ערכים לא תקינים. דוגמה: שעה `15:30 / 2` · רמות `10:1.5, 15:3` · `10 / 10 / 2` · סיכון `50` · `שניהם / 4 / כן` "
+                "(עסקאות 2-30, סיכון 1-100%, סטופ אחרי TP 1-7 כמו בתפריט 🔒)", ephemeral=True)
+            return
+        self.block.params.update(new)
+        self.block.bot.settings.save()
+        await interaction.response.send_message("✅ הגדרות החדשות נשמרו", ephemeral=True, delete_after=10)
+        await self.block.bot.render_news()
+
+
+class NewsAccountSelect(discord.ui.Select):
+    def __init__(self, block):
+        engines = [e for e in block.bot.engines if e.account]
+        options = [discord.SelectOption(label=f"{account_label(e.account)} · {e.name}"[:100], value=e.account,
+                                        default=e.account == block.data["account"]) for e in engines][:25]
+        if not options:
+            options = [discord.SelectOption(label="אין משכפל עם חשבון - בחר חשבון במשכפל קודם", value="none")]
+        super().__init__(placeholder="על איזה חשבון לשים את פקודות החדשות", options=options, custom_id="news:account", row=1)
+        self.block = block
+
+    async def callback(self, interaction):
+        if self.values[0] == "none":
+            await interaction.response.defer()
+            return
+        self.block.data["account"] = self.values[0]
+        self.block.bot.settings.save()
+        await interaction.response.send_message(f"📰 חדשות על {account_label(self.values[0])}", ephemeral=True, delete_after=10)
+        await self.block.bot.render_news()
+
+
+class ConfirmLaunch(discord.ui.View):
+    def __init__(self, block, engine):
+        super().__init__(timeout=120)
+        self.block = block
+        self.engine = engine
+
+    @discord.ui.button(label="כן, לשגר", emoji="🚀", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction, button):
+        await interaction.response.edit_message(content="🚀 מציב פקודות…", view=None)
+        try:
+            spec = news_spec(self.block.params)
+            out = await asyncio.to_thread(self.engine.manager.request, "launch", spec)
+        except Exception as exc:
+            await interaction.edit_original_response(content=f"⚠️ לא הוצב: {exc}")
+            return
+        until = datetime.fromtimestamp(spec["expire_at"], IL).strftime("%H:%M")
+        text = "✅ הוצבו:\n" + "\n".join(f"• {x}" for x in out["lines"]) + f"\nמה שלא נתפס עד {until} יבוטל."
+        if out["errors"]:
+            text += f"\n⚠️ {out['errors'][0]}"
+        self.block.last = f"🚀 הוצבו פקודות חדשות, ביטול ב-{until}"
+        await interaction.edit_original_response(content=text)
+        await self.block.bot.render_news()
+
+    @discord.ui.button(label="ביטול", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction, button):
+        await interaction.response.edit_message(content="בוטל.", view=None)
+
+
+class NewsBlock(discord.ui.View):
+    """📰 the news block: account, settings, preview, launch, cancel."""
+
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.add_item(NewsAccountSelect(self))
+
+    @property
+    def data(self):
+        return self.bot.settings.data["news"]
+
+    @property
+    def params(self):
+        return self.data["params"]
+
+    @property
+    def last(self):
+        return self.bot.news_last
+
+    @last.setter
+    def last(self, text):
+        self.bot.news_last = f"{text} · {time.strftime('%H:%M:%S')}"
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("אין לך הרשאה ללוח הזה.", ephemeral=True)
+            return False
+        return True
+
+    def engine(self):
+        return next((e for e in self.bot.engines if e.account and e.account == self.data["account"]), None)
+
+    async def _ready(self, interaction):
+        engine = self.engine()
+        if engine is None:
+            await interaction.response.send_message("קודם בחר חשבון בתפריט של בלוק החדשות.", ephemeral=True, delete_after=15)
+        elif engine.manager is None or engine.manager.summary is None:
+            await interaction.response.send_message("המשכפל של החשבון הזה עוד לא מחובר - נסה שוב עוד רגע.", ephemeral=True, delete_after=15)
+        else:
+            return engine
+        return None
+
+    async def _plan(self, engine):
+        spec = news_spec(self.params)
+        return await asyncio.to_thread(engine.manager.request, "plan", spec), spec
+
+    @discord.ui.button(label="תצוגה מקדימה", emoji="🔍", style=discord.ButtonStyle.secondary, custom_id="news:plan", row=0)
+    async def preview(self, interaction, button):
+        engine = await self._ready(interaction)
+        if not engine:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            plan, _ = await self._plan(engine)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            return
+        await interaction.followup.send("🔍 **אם תשגר עכשיו:**\n" + plan_text(plan, self.params)
+                                        + ("" if plan["ok"] else f"\n⛔ {plan['reason']}"), ephemeral=True)
+
+    @discord.ui.button(label="שגר פקודות", emoji="🚀", style=discord.ButtonStyle.success, custom_id="news:launch", row=0)
+    async def launch(self, interaction, button):
+        engine = await self._ready(interaction)
+        if not engine:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            plan, spec = await self._plan(engine)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            return
+        if not plan["ok"]:
+            await interaction.followup.send(plan_text(plan, self.params) + f"\n⛔ {plan['reason']}", ephemeral=True)
+            return
+        live = split_key(engine.account)[0] == "live"
+        until = datetime.fromtimestamp(spec["expire_at"], IL).strftime("%H:%M")
+        head = (f"⚠️ **{account_label(engine.account)} - כסף אמיתי.**\n" if live else "") + \
+            f"🚀 **לשגר על {account_label(engine.account)}?** (ביטול של מה שלא נתפס ב-{until})\n" + \
+            f"ההצבה לוקחת כ-{max(5, len(plan['levels']) * plan['trades'] // 4)} שניות - לשגר כמה דקות לפני החדשה.\n"
+        await interaction.followup.send(head + plan_text(plan, self.params), view=ConfirmLaunch(self, engine), ephemeral=True)
+
+    @discord.ui.button(label="הגדרות", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="news:settings", row=0)
+    async def settings_button(self, interaction, button):
+        await interaction.response.send_modal(NewsModal(self))
+
+    @discord.ui.button(label="בטל פקודות חדשות", emoji="🗑", style=discord.ButtonStyle.danger, custom_id="news:cancel", row=0)
+    async def cancel(self, interaction, button):
+        engine = await self._ready(interaction)
+        if not engine:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            count = await asyncio.to_thread(engine.manager.request, "cancel", {})
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            return
+        self.last = f"🗑 בוטלו {count} פקודות חדשות"
+        await interaction.followup.send(f"🗑 בוטלו {count} פקודות שלא נתפסו (עסקאות שכבר נפתחו ממשיכות כרגיל)", ephemeral=True)
+        await self.bot.render_news()
+
+
+def news_embed(bot):
+    n = bot.settings.data["news"]["params"]
+    acc = bot.settings.data["news"]["account"]
+    engine = next((e for e in bot.engines if e.account and e.account == acc), None)
+    mode = SL_MODES[int(n["sl_mode"]) - 1][1]
+    levels = " · ".join(f"{d}$ מהמחיר (TP כל {st}$)" for d, st in (x.split(":") for x in n["levels"].replace(" ", "").split(",")))
+    lines = [
+        f"**חשבון:** {account_label(acc) if acc else '— בחר בתפריט'}" + (f" ({engine.name})" if engine else ""),
+        f"**שעת החדשה:** {n['news_time'] or 'לא נקבעה (הביטול נספר מרגע השיגור)'} · ביטול {n['expire_min']:g} דק׳ אחרי",
+        f"**כיוון:** {n['sides']} · **רמות:** {levels}",
+        f"**עסקאות לרמה:** עד {n['trades']} · SL {n['sl']:g}$ · Runner {'כן' if n['runner'] else 'לא'} · סטופ אחרי TP: {mode}",
+        f"**גודל:** לפי היתרה - סיכון מקסימלי {n['risk_pct']:g}% (כולל החלקה של {n['slip']:g}$ בסטופ)",
+    ]
+    groups = engine.news_groups() if engine else []
+    if groups:
+        lines += ["", f"**פקודות חדשות פעילות ({len(groups)}):**"]
+        lines += [f"• {'קנייה' if g['side'] == 'buy' else 'מכירה'} @{g['entry']} · {g['members']} עסקאות"
+                  + (" (ממתינה)" if g["kind"] == "pending" else " · SL " + str(g["sl"])) for g in groups[:6]]
+    if bot.news_last:
+        lines += ["", f"**עדכון אחרון:** {bot.news_last}"]
+    return discord.Embed(title="📰 חדשות", description="\n".join(lines), color=0xf1c40f)
+
+
 class Panel(discord.ui.View):
     def __init__(self, bot, engine):
         super().__init__(timeout=None)
@@ -910,6 +1181,7 @@ class LadderBot(discord.Client):
         self.settings = settings
         self.accounts = []
         self.panel_lock = asyncio.Lock()
+        self.news_last = ""
 
     def taken_accounts(self, engine):
         return {e.account for e in self.engines if e is not engine and e.account}
@@ -925,6 +1197,7 @@ class LadderBot(discord.Client):
         self.add_view(Header(self))     # buttons work after restarts
         for engine in self.engines:
             self.add_view(Panel(self, engine))
+        self.add_view(NewsBlock(self))
         self.loop.create_task(self._refresher())
 
     async def on_ready(self):
@@ -939,6 +1212,22 @@ class LadderBot(discord.Client):
         await self.render_header()
         for engine in self.engines:
             await self.render_panel(engine)
+        await self.render_news()
+
+    async def render_news(self):
+        async with self.panel_lock:
+            channel = await self._channel()
+            data = self.settings.data["news"]
+            if data["message"]:
+                try:
+                    msg = await channel.fetch_message(data["message"])
+                    await msg.edit(embed=news_embed(self), view=NewsBlock(self))
+                    return
+                except discord.NotFound:
+                    pass
+            msg = await channel.send(embed=news_embed(self), view=NewsBlock(self))
+            data["message"] = msg.id
+            self.settings.save()
 
     async def render_guide(self):
         async with self.panel_lock:
@@ -953,13 +1242,15 @@ class LadderBot(discord.Client):
                     pass
             # the guide is the first message: the header and the panels are reposted under it
             ladders = self.settings.data["ladders"]
-            for mid in [self.settings.data["header_message"]] + [lad["panel_message"] for lad in ladders]:
+            for mid in [self.settings.data["header_message"], self.settings.data["news"]["message"]] + \
+                    [lad["panel_message"] for lad in ladders]:
                 if mid:
                     try:
                         await (await channel.fetch_message(mid)).delete()
                     except discord.HTTPException:
                         pass
             self.settings.data["header_message"] = 0
+            self.settings.data["news"]["message"] = 0
             for ladder in ladders:
                 ladder["panel_message"] = 0
             msg = await channel.send(embeds=guide_embeds())
@@ -978,6 +1269,13 @@ class LadderBot(discord.Client):
                 except discord.NotFound:
                     pass
             # the header goes on top: repost the panels under it
+            news = self.settings.data["news"]
+            if news["message"]:
+                try:
+                    await (await channel.fetch_message(news["message"])).delete()
+                except discord.HTTPException:
+                    pass
+                news["message"] = 0
             for ladder in self.settings.data["ladders"]:
                 if ladder["panel_message"]:
                     try:
@@ -1022,7 +1320,19 @@ class LadderBot(discord.Client):
         self.add_view(Panel(self, engine))
         await self.render_header()
         await self.render_panel(engine)
+        await self.repost_news()
         return engine
+
+    async def repost_news(self):
+        """Keep the news block the last message (a new panel was posted under it)."""
+        data = self.settings.data["news"]
+        if data["message"]:
+            try:
+                await (await (await self._channel()).fetch_message(data["message"])).delete()
+            except discord.HTTPException:
+                pass
+            data["message"] = 0
+        await self.render_news()
 
     async def delete_ladder(self, engine):
         await asyncio.to_thread(engine.stop_engine)
@@ -1051,6 +1361,13 @@ class LadderBot(discord.Client):
                         await self.render_panel(engine)
                     except Exception as exc:
                         log.warning(f"panel refresh failed: {exc}")
+            key = json.dumps([[e.news_groups() for e in self.engines], self.news_last], default=str)
+            if key != last.get("news"):
+                last["news"] = key
+                try:
+                    await self.render_news()
+                except Exception as exc:
+                    log.warning(f"news refresh failed: {exc}")
             key = json.dumps([e.status_line() for e in self.engines])
             if key != last.get("header"):
                 last["header"] = key

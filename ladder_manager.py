@@ -47,6 +47,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import socketio
@@ -101,6 +102,9 @@ TRANSLATIONS = {
         "lock_tp1": "🔐 <b>המחיר המשיך - סטופ ל-TP1</b>",
         "step_up": "🪜 <b>מדרגה - סטופ עלה</b>",
         "group_done": "🏁 <b>הקבוצה נסגרה</b>",
+        "news_placed": "📰 <b>פקודות חדשות הוצבו</b>",
+        "news_expired": "⌛ <b>פקודות חדשות לא נתפסו - בוטלו</b>",
+        "news_cancel": "🗑 <b>פקודות חדשות בוטלו</b>",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
         "auto": "אוטומטי", "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
@@ -118,6 +122,9 @@ TRANSLATIONS = {
         "lock_tp1": "🔐 <b>Price ran on - stop to TP1</b>",
         "step_up": "🪜 <b>Step - stop moved up</b>",
         "group_done": "🏁 <b>Group closed</b>",
+        "news_placed": "📰 <b>News orders placed</b>",
+        "news_expired": "⌛ <b>News orders not filled - cancelled</b>",
+        "news_cancel": "🗑 <b>News orders cancelled</b>",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
         "auto": "auto", "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
@@ -303,6 +310,8 @@ class LadderManager:
         self.first_seen = {}    # pid -> time first seen (stream: SL/TP orders arrive right after the Position)
         self.tags = {}          # order id -> strategy tag, for orders this service sent
         self.strategy = {}      # "p:<id>" / "o:<id>" -> strategyId ("" = manual), resolved via REST
+        self.requests = []      # work the Discord panel asks for, run on this thread at the next tick (see request)
+        self.req_lock = threading.Lock()
 
     # ==================================================================
     # General helpers
@@ -701,6 +710,13 @@ class LadderManager:
                 continue
             children = [o for o in pending.values() if o["strategy"] == tag]
             parent = pending[g["parent_order"]] if g["parent_order"] in pending else None
+            if parent and "expire_at" in g and time.time() > g["expire_at"]:
+                # news orders that did not fill in time: the move is over, cancel the whole ladder
+                for c in [self.pool.submit(self._retry_429, self._delete_order, o["id"]) for o in children]:
+                    c.result()
+                del self.state["groups"][tag]
+                self._broadcast(self._t("news_expired"), [f"{g['side']} @{g['entry']} · {len(children)}"])
+                continue
             if parent:
                 entry = parent["price"] if g["type"] == "limit" else parent["stop_price"]
                 if not self._same(entry, g["entry"]):
@@ -941,9 +957,137 @@ class LadderManager:
                     c.result()
 
     # ==================================================================
+    # News: pending ladders placed in advance from the Discord news block
+    # ==================================================================
+    def request(self, kind, spec, timeout=90):
+        """Called from another thread (Discord): run "plan" / "launch" / "cancel" on the manager's own thread, which
+        owns the API session and the state, and wait for the answer."""
+        req = {"kind": kind, "spec": spec, "done": threading.Event()}
+        with self.req_lock:
+            self.requests.append(req)
+        if self.feed:
+            self.feed.changed.set()
+        if not req["done"].wait(timeout):
+            raise RuntimeError("השרת לא ענה בזמן")
+        if "error" in req:
+            raise RuntimeError(req["error"])
+        return req["result"]
+
+    def news_plan(self, spec):
+        """Size the news orders from the account: the worst case (on every side the trades of one level fill and stop
+        out, sl + slip $ each) stays within risk_pct of the balance, and one level fits the free margin.
+        spec: sides [1, -1], levels [[distance, tp_step], ...], trades, sl, slip, risk_pct."""
+        state = self.api.get_account_state()
+        details = self.api.get_instrument_details(self.instr_id)
+        leverage, lot_size = float(details["leverage"]), float(details["lotSize"])
+        ask, bid = self.api.get_latest_asking_price(self.instr_id), self.api.get_latest_bid_price(self.instr_id)
+        price = self._round((ask + bid) / 2)
+        balance, free = float(state["balance"]), float(state["availableFunds"])
+        sides = spec["sides"]
+        loss = spec["sl"] + spec["slip"]                # $ per oz when a trade stops out, with slippage
+        budget = balance * spec["risk_pct"] / 100
+        trades = spec["trades"]
+        oz = int(budget / (len(sides) * trades * loss))     # ounces per trade (0.01 lot = lot_size/100 oz)
+        min_oz = lot_size * 0.01
+        if oz < min_oz:
+            oz = min_oz
+            trades = int(budget / (len(sides) * loss * oz))
+        oz = int(oz / min_oz) * min_oz
+        # one level of one side fills at once (the farther level only after the nearer one runs)
+        fit = int(0.8 * free / (oz * price / leverage)) if free > 0 else 0
+        reason = ""
+        if fit < trades:
+            trades, reason = fit, "מוגבל לפי המרווח הפנוי"
+        plan = dict(balance=balance, free=free, leverage=leverage, price=price, trades=trades,
+                    lot=round(oz / lot_size, 2), risk=round(len(sides) * trades * oz * loss, 2),
+                    margin=round(trades * oz * price / leverage, 2), reason=reason, ok=trades >= 2,
+                    levels=[])
+        if not plan["ok"]:
+            plan["reason"] = reason or f"הסיכון {spec['risk_pct']:g}% מהיתרה לא מספיק לשתי עסקאות"
+        for s in sides:
+            for dist, step in spec["levels"]:
+                entry = self._round(price + s * dist)
+                plan["levels"].append(dict(side="buy" if s > 0 else "sell", entry=entry, sl=self._round(entry - s * spec["sl"]),
+                                           step=step, tp1=self._round(entry + s * step),
+                                           last=self._round(entry + s * step * (trades - (1 if spec["runner"] else 0)))))
+        return plan
+
+    def _retry_429(self, fn, *args):
+        """Dozens of orders at once hit the server's rate limit (429): wait and send again."""
+        for attempt in range(5):
+            try:
+                return fn(*args)
+            except Exception as exc:
+                if "429" not in str(exc) or attempt == 4:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+
+    def _news_launch(self, spec):
+        plan = self.news_plan(spec)
+        if not plan["ok"]:
+            raise RuntimeError(plan["reason"])
+        stamp = int(time.time()) % 1000000
+        lines, errors = [], []
+        for i, lv in enumerate(plan["levels"]):
+            s = 1 if lv["side"] == "buy" else -1
+            tag = f"{self.p['strategy_tag']}-N{stamp}{lv['side'][0].upper()}{i}"
+            tps = [self._round(lv["entry"] + s * lv["step"] * (k + 1)) for k in range(plan["trades"])]
+            if spec["runner"]:
+                tps[-1] = None
+            src = {"side": lv["side"], "type": "stop", "price": 0.0, "stop_price": lv["entry"]}
+            futures = [self.pool.submit(self._retry_429, self._pending, src, plan["lot"], tp, lv["sl"], tag) for tp in tps]
+            ids = []
+            for f in futures:
+                try:
+                    oid = f.result()
+                    if oid:
+                        ids.append(str(oid))
+                except Exception as exc:
+                    errors.append(str(exc)[:200])
+            if ids:
+                self.state["groups"][tag] = {
+                    "kind": "pending", "side": lv["side"], "entry": lv["entry"], "parent_order": ids[0], "type": "stop",
+                    "target_sl": lv["sl"] if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
+                    "step": lv["step"], "tp1": tps[0], "auto_sl": 0, "news": True, "expire_at": spec["expire_at"],
+                    "cfg": dict({k: self.p[k] for k in GROUP_KEYS}, **spec["cfg"]),
+                }
+            lines.append(f"{lv['side']} stop {lv['entry']} · {len(ids)}/{len(tps)} × {plan['lot']} · TP כל {lv['step']:g}$ · SL {lv['sl']}")
+        self._save_state()
+        until = datetime.fromtimestamp(spec["expire_at"], ZoneInfo("Asia/Jerusalem")).strftime("%H:%M")
+        self._broadcast(self._t("news_placed"), lines + [f"ביטול אם לא נתפס עד {until}"])
+        if errors:
+            self._broadcast(self._t("error"), errors[:1])
+        return dict(plan=plan, lines=lines, errors=errors)
+
+    def _news_cancel(self, spec):
+        """Cancel every news ladder that has not filled yet."""
+        orders = self.snapshot()
+        pending = orders[1] if orders else {}
+        count = 0
+        for tag, g in list(self.state["groups"].items()):
+            if "news" in g and g["kind"] == "pending":
+                left = [o for o in pending.values() if o["strategy"] == tag]
+                for c in [self.pool.submit(self._retry_429, self._delete_order, o["id"]) for o in left]:
+                    c.result()
+                count += len(left)
+                del self.state["groups"][tag]
+        self._save_state()
+        self._broadcast(self._t("news_cancel"), [f"{count}"])
+        return count
+
+    # ==================================================================
     # Main loop
     # ==================================================================
     def tick(self):
+        with self.req_lock:
+            reqs, self.requests = self.requests, []
+        for req in reqs:
+            try:
+                req["result"] = {"plan": self.news_plan, "launch": self._news_launch,
+                                 "cancel": self._news_cancel}[req["kind"]](req["spec"])
+            except Exception as exc:
+                req["error"] = str(exc)[:300]
+            req["done"].set()
         snap = self.snapshot()
         if snap is None:
             return
@@ -990,7 +1134,7 @@ class LadderManager:
             "groups": [{"tag": tag, "side": g["side"], "entry": g["entry"], "sl": g["target_sl"],
                         "members": sum(1 for p in positions.values()
                                        if p["strategy"] == tag or ("parent" in g and p["id"] == g["parent"])),
-                        "kind": g["kind"]}
+                        "kind": g["kind"], "news": "news" in g}
                        for tag, g in self.state["groups"].items()],
         }
 
