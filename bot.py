@@ -234,6 +234,7 @@ class Settings:
                 news.setdefault(key, value)
             if news["levels"] == "10:1.5, 15:3" and news["trades"] == 10:   # the first defaults, never changed by hand
                 news.update(levels=NEWS_DEFAULTS["levels"], trades=NEWS_DEFAULTS["trades"])
+                self.save()
         if not self.data["ladders"]:
             self.new_ladder(os.environ.get("TL_ACCOUNT_ID", ""))
 
