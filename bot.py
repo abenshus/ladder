@@ -132,8 +132,9 @@ def template_summary(t):
 
 
 # the news block: stop orders on both sides placed in advance, each one a ladder (defaults = what the backtest liked:
-# 10$ away TP every 1.5$, 15$ away TP every 3$, SL 10, BE at TP2 then a step every TP, cancelled 2 min after the release)
-NEWS_DEFAULTS = dict(sides="שניהם", levels="10:1.5, 15:3", trades=10, sl=10.0, slip=2.0, risk_pct=50.0,
+# one level 10$ away with up to 20 trades, TP every 1.5$, SL 10, BE at TP2 then a step every TP, cancelled 2 min after
+# the release; a second level 15$ away did worse than putting the same ounces at 10$)
+NEWS_DEFAULTS = dict(sides="שניהם", levels="10:1.5", trades=20, sl=10.0, slip=2.0, risk_pct=50.0,
                      news_time="", expire_min=2.0, sl_mode=4, runner=True)
 IL = ZoneInfo("Asia/Jerusalem")
 SIDES = {"שניהם": [1, -1], "קנייה": [1], "מכירה": [-1]}
@@ -228,8 +229,11 @@ class Settings:
                                       "panel_message": loaded.pop("panel_message", 0),
                                       "params": loaded.pop("params", {"enabled": False})}]
             self.data.update(loaded)
+            news = self.data["news"]["params"]
             for key, value in NEWS_DEFAULTS.items():        # settings added after the block was first saved
-                self.data["news"]["params"].setdefault(key, value)
+                news.setdefault(key, value)
+            if news["levels"] == "10:1.5, 15:3" and news["trades"] == 10:   # the first defaults, never changed by hand
+                news.update(levels=NEWS_DEFAULTS["levels"], trades=NEWS_DEFAULTS["trades"])
         if not self.data["ladders"]:
             self.new_ladder(os.environ.get("TL_ACCOUNT_ID", ""))
 
@@ -453,7 +457,7 @@ GUIDE = [
 ואחר כך בוחרים תבנית מהרשימה וכל ההגדרות נטענות בבת אחת - למשל סקאלפ מהיר מול עסקה ארוכה. ➕ פותח חלון עם ההגדרות \
 הנוכחיות כטקסט (שורה לכל הגדרה) - משנים, נותנים שם ושומרים. עסקאות שכבר פתוחות ממשיכות עם ההגדרות שהן נפתחו איתן.
 📰 **בלוק חדשות** (בסוף הערוץ) - בוחרים חשבון שרץ עליו משכפל, ⚙️ שעת החדשה והגדרות, 🔍 תצוגה מקדימה, 🚀 שגר. \
-הוא שם פקודות Stop לשני הכיוונים (ברירת מחדל 10$ ו-15$ מהמחיר), כל אחת סולם עם TP-ים משלה, מחשב את הגודל לפי היתרה, \
+הוא שם פקודות Stop לשני הכיוונים (ברירת מחדל 10$ מהמחיר, עד 20 עסקאות), כל אחת סולם עם TP-ים משלה, מחשב את הגודל לפי היתרה, \
 המינוף והסיכון שבחרת, ומבטל מה שלא נתפס 2 דקות אחרי החדשה.
 🎯 **Runner בכניסה** - במצבים "שני שלבים" ו"מיד ל-TP1": כשהשאר עוברות ל-TP1, ה-Runner נשאר בכניסה (סיכון 0, יותר מקום לרוץ). \
 במצבי המדרגות ה-Runner תמיד עולה יחד עם כולן."""),
