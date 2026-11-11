@@ -66,6 +66,15 @@ TEMPLATE_KEYS = ("copies", "tp_step", "runner_last", "runner_keep_be", "auto_sl"
                  "be_after_tp1", "be_to", "step_every", "step_start")
 
 
+# templates that come with the bot, added once (a deleted one stays deleted).
+# "UK סבלנות": what the UK channel backtest liked (534 signals, 08/2025-11/2026) - TP every 3$ (his TP spacing), SL 11$
+# (his heat before TP3 needs room), nothing at TP1, entry at TP2, then a step every TP: +2.19$/oz a signal, win 82%
+BUILTIN_TEMPLATES = {
+    "UK סבלנות": dict(copies=5, tp_step=3.0, runner_last=True, runner_keep_be=False, auto_sl=11.0, be_offset=0.5,
+                      lock_tp1_at=0.5, be_after_tp1=True, be_to="steps", step_every=1, step_start=2),
+}
+
+
 def template_text(p):
     """The settings as the template window shows them, with the SL modes listed under it."""
     lines = []
@@ -239,6 +248,12 @@ class Settings:
                 news.setdefault(key, value)
             if news["levels"] == "10:1.5, 15:3" and news["trades"] == 10:   # the first defaults, never changed by hand
                 news.update(levels=NEWS_DEFAULTS["levels"], trades=NEWS_DEFAULTS["trades"])
+                self.save()
+        seeded = self.data.setdefault("seeded_templates", [])
+        for name, t in BUILTIN_TEMPLATES.items():
+            if name not in seeded:
+                self.data["templates"].setdefault(name, dict(t))
+                seeded.append(name)
                 self.save()
         if not self.data["ladders"]:
             self.new_ladder(os.environ.get("TL_ACCOUNT_ID", ""))
