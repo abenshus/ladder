@@ -946,8 +946,12 @@ class LadderManager:
         sign = 1 if g["side"] == "buy" else -1
         worst = max(m["price"] * sign for m in members) * sign
         be = self._round(worst + sign * self._c(g, "be_offset"))
-        if g["target_sl"] is not None and (g["target_sl"] - worst) * sign > 0:
-            return sl       # the SL was already in profit: a break-even click now asks for room - keep it at the entry
+        if g["target_sl"] is not None and (g["target_sl"] - worst) * sign > 0 and "single" not in g \
+                and "manual_sl" not in g:
+            # the SL was already in profit: a break-even click now asks for room - still entry + be_offset, but the
+            # automatic steps stop for this ladder, or the next TP would take the room away
+            g["manual_sl"] = True
+            self._broadcast(self._t("manual_sl"), [f"{self._t('sl')}: {be}"])
         marks = [m["mark"] for m in members if m["mark"] is not None]
         if marks and (marks[0] - be) * sign <= 0.2:
             g["be_wait"] = [sl, be]     # moved there as soon as the price allows (_be_wait)
@@ -1057,7 +1061,8 @@ class LadderManager:
                     changed_to = self._be_click(g, members, changed_to)
                 if changed_to is not None:
                     sign = 1 if g["side"] == "buy" else -1
-                    if g["target_sl"] is not None and (changed_to - g["target_sl"]) * sign < 0 and not g.get("single"):
+                    if g["target_sl"] is not None and (changed_to - g["target_sl"]) * sign < 0 and not g.get("single") \
+                            and "manual_sl" not in g:
                         # the user gave the SL room (lower for a buy, higher for a sell), break-even included:
                         # the automatic steps stop for this ladder, or the next TP would take the room away
                         g["manual_sl"] = True
