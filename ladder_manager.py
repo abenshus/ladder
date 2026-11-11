@@ -931,6 +931,18 @@ class LadderManager:
             return g["runner_sl"]
         return g["target_sl"]
 
+    def _be_click(self, g, members, sl):
+        """The user pressed break-even on a trade (SL = its own entry): all of them get entry + be_offset instead,
+        from the worst entry among them, so every trade closes in profit there. If the price is not that far yet,
+        the SL stays at the entry."""
+        sign = 1 if g["side"] == "buy" else -1
+        worst = max(m["price"] * sign for m in members) * sign
+        be = self._round(worst + sign * self._c(g, "be_offset"))
+        marks = [m["mark"] for m in members if m["mark"] is not None]
+        if marks and (marks[0] - be) * sign <= 0.2:
+            return sl
+        return be
+
     def _sync_tp(self, g, members, now):
         """The user moved the TP of one trade (not the runner): every trade with a TP gets that same price, so they
         all close together there. The runner (no TP) stays without one."""
@@ -995,6 +1007,7 @@ class LadderManager:
             if self.p["sync_sl"]:
                 changed_to = None
                 removed = False
+                be_click = False
                 for m in members:
                     prev = g["seen_sl"][m["id"]] if m["id"] in g["seen_sl"] else "unseen"
                     if prev == "unseen" and m["id"] == g["parent"] and "sl_auto" in g and g["sl_auto"] \
@@ -1005,11 +1018,14 @@ class LadderManager:
                     if prev != "unseen" and not self._same(prev, m["sl"]):
                         if m["sl"] is not None and (clear or not self._same(m["sl"], self._want_sl(g, m))):
                             changed_to = m["sl"]
+                            be_click = abs(m["sl"] - m["price"]) <= 0.02     # the terminal's break-even button
                         elif m["sl"] is None and g["target_sl"] is not None and self.p["sync_sl_delete"]:
                             removed = True
                     g["seen_sl"][m["id"]] = m["sl"]
                 if "runner_sl" in g and (changed_to is not None or removed):
                     del g["runner_sl"]          # the user's own SL change goes to all of them, runner included
+                if changed_to is not None and be_click and self._c(g, "be_offset"):
+                    changed_to = self._be_click(g, members, changed_to)
                 if changed_to is not None:
                     g["target_sl"] = changed_to
                     g["clear_sl"] = clear = False
