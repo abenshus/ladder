@@ -638,7 +638,13 @@ class LadderManager:
             self._broadcast(self._t("error"), errors[:1])
         if opened == 1 and not reduce:
             # no copy opened (a trade on the whole account: no margin left for copies): it is not a ladder, so the
-            # user's own SL/TP stay as they are - no TP1, no auto SL, no group
+            # user's own SL/TP stay as they are - no TP1, no auto SL. A one-trade group only watches its SL, so the
+            # terminal's break-even button still gets be_offset (see _be_click)
+            self.state["groups"][tag] = {
+                "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"], "target_sl": None,
+                "seen_sl": {}, "max_members": 0, "be_stage": 0, "tp1": None, "step": self.p["tp_step"],
+                "cfg": {k: self.p[k] for k in GROUP_KEYS}, "single": True,
+            }
             self._broadcast(self._t("single"), [f"{pos['side']} {pos['qty']} @ {pos['price']}"])
             return
         # one PATCH sets SL and TP together (a missing field clears it); a TP whose order hasn't arrived yet
@@ -989,7 +995,8 @@ class LadderManager:
                 for pid in list(self.sl_pending):
                     if pid not in positions:
                         del self.sl_pending[pid]
-                self._broadcast(self._t("group_done"), [tag])
+                if "single" not in g:
+                    self._broadcast(self._t("group_done"), [tag])
                 continue
             g["max_members"] = max(g["max_members"], len(members))
             self._track(g, members)

@@ -8,7 +8,7 @@ Turns one manual TradeLocker trade into a ladder of trades with stepped take-pro
 - TPs every `tp_step` dollars, the last trade without a TP (runner) unless turned off.
 - Move the SL of any trade → all get it within ~2s. Delete it → removed from all (or restored, `sync_sl_delete=False`).
 - Move the TP of any trade that has one → all trades with a TP get that same price (they close together there); the runner stays without a TP.
-- A trade too big for copies (no margin left, none opened) is not a ladder: its own SL/TP stay as you set them (no TP1, no auto SL, no group).
+- A trade too big for copies (no margin left, none opened) is not a ladder: its own SL/TP stay as you set them (no TP1, no auto SL); a one-trade group only watches it so break-even still gets `be_offset`.
 - Break-even pressed in the terminal on any trade (SL = its own entry) → all trades get the worst entry among them + `be_offset` (in profit), if the price is at least 0.2$ past it; otherwise the SL stays at the entry.
 - An SL you set that reaches the server after the trade (the ladder saw it without one and planned an auto SL) wins over the auto SL and goes to all.
 - `auto_sl` (default 10): a trade or pending order opened without an SL gets one this many dollars from entry (deleting it follows `sync_sl_delete`; a moved pending order keeps the distance).
