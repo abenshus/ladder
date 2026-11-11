@@ -98,6 +98,7 @@ TRANSLATIONS = {
         "pending_filled": "✅ <b>פקודה התמלאה</b>",
         "sl_sync": "🛡 <b>סטופ סונכרן</b>",
         "tp_sync": "🎯 <b>TP סונכרן</b>",
+        "manual_sl": "✋ <b>נתת לסטופ אוויר - המדרגות האוטומטיות נעצרו בסולם הזה</b>",
         "single": "↪️ <b>אין מרווח לעותקים - העסקה נשארת כמו שפתחת (בלי TP/SL של הסולם)</b>",
         "sl_cleared": "🚫 <b>סטופ נמחק מכל העסקאות</b>",
         "be": "🔒 <b>TP1 נתפס - סטופ הוזז</b>",
@@ -121,6 +122,7 @@ TRANSLATIONS = {
         "pending_filled": "✅ <b>Order filled</b>",
         "sl_sync": "🛡 <b>Stop synced</b>",
         "tp_sync": "🎯 <b>TP synced</b>",
+        "manual_sl": "✋ <b>You gave the stop room - automatic steps stopped for this ladder</b>",
         "single": "↪️ <b>No margin for copies - the trade stays as you opened it (no ladder TP/SL)</b>",
         "sl_cleared": "🚫 <b>Stop removed from all trades</b>",
         "be": "🔒 <b>TP1 hit - stop moved</b>",
@@ -944,10 +946,30 @@ class LadderManager:
         sign = 1 if g["side"] == "buy" else -1
         worst = max(m["price"] * sign for m in members) * sign
         be = self._round(worst + sign * self._c(g, "be_offset"))
+        if g["target_sl"] is not None and (g["target_sl"] - worst) * sign > 0:
+            return sl       # the SL was already in profit: a break-even click now asks for room - keep it at the entry
         marks = [m["mark"] for m in members if m["mark"] is not None]
         if marks and (marks[0] - be) * sign <= 0.2:
+            g["be_wait"] = [sl, be]     # moved there as soon as the price allows (_be_wait)
             return sl
         return be
+
+    def _be_wait(self, g, members):
+        """After a break-even click the price was too close for entry + be_offset: move the SL there once it is
+        0.2$ past it - unless the SL was changed meanwhile (by the user or the steps)."""
+        if "be_wait" not in g:
+            return
+        sl, be = g["be_wait"]
+        if not self._same(g["target_sl"], sl):
+            del g["be_wait"]
+            return
+        sign = 1 if g["side"] == "buy" else -1
+        marks = [m["mark"] for m in members if m["mark"] is not None]
+        if marks and (marks[0] - be) * sign > 0.2:
+            del g["be_wait"]
+            g["target_sl"] = be
+            self._broadcast(self._t("sl_sync"), [f"{self._t('sl')}: {be} (BE + {self._c(g, 'be_offset'):g})",
+                                                 f"{self._t('count')}: {len(members)}"])
 
     def _sync_tp(self, g, members, now):
         """The user moved the TP of one trade (not the runner): every trade with a TP gets that same price, so they
@@ -1034,6 +1056,12 @@ class LadderManager:
                 if changed_to is not None and be_click and self._c(g, "be_offset"):
                     changed_to = self._be_click(g, members, changed_to)
                 if changed_to is not None:
+                    sign = 1 if g["side"] == "buy" else -1
+                    if g["target_sl"] is not None and (changed_to - g["target_sl"]) * sign < 0 and not g.get("single"):
+                        # the user gave the SL room (lower for a buy, higher for a sell), break-even included:
+                        # the automatic steps stop for this ladder, or the next TP would take the room away
+                        g["manual_sl"] = True
+                        self._broadcast(self._t("manual_sl"), [f"{self._t('sl')}: {changed_to}"])
                     g["target_sl"] = changed_to
                     g["clear_sl"] = clear = False
                     self._broadcast(self._t("sl_sync"), [f"{self._t('sl')}: {changed_to}",
@@ -1043,10 +1071,11 @@ class LadderManager:
                     g["clear_sl"] = clear = True
                     self._broadcast(self._t("sl_cleared"), [f"{self._t('count')}: {len(members)}"])
             g["sl_auto"] = False
+            self._be_wait(g, members)
 
             self._sync_tp(g, members, now)
 
-            if self._c(g, "be_after_tp1") and g["max_members"] >= 2:
+            if self._c(g, "be_after_tp1") and g["max_members"] >= 2 and "manual_sl" not in g:
                 clear = self._move_after_tp1(g, members, clear)
 
             if g["target_sl"] is not None or clear:
