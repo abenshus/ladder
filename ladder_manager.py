@@ -97,6 +97,8 @@ TRANSLATIONS = {
         "pending_cancel": "🗑 <b>פקודות בוטלו</b>",
         "pending_filled": "✅ <b>פקודה התמלאה</b>",
         "sl_sync": "🛡 <b>סטופ סונכרן</b>",
+        "tp_sync": "🎯 <b>TP סונכרן</b>",
+        "single": "↪️ <b>אין מרווח לעותקים - העסקה נשארת כמו שפתחת (בלי TP/SL של הסולם)</b>",
         "sl_cleared": "🚫 <b>סטופ נמחק מכל העסקאות</b>",
         "be": "🔒 <b>TP1 נתפס - סטופ הוזז</b>",
         "lock_tp1": "🔐 <b>המחיר המשיך - סטופ ל-TP1</b>",
@@ -118,6 +120,8 @@ TRANSLATIONS = {
         "pending_cancel": "🗑 <b>Orders cancelled</b>",
         "pending_filled": "✅ <b>Order filled</b>",
         "sl_sync": "🛡 <b>Stop synced</b>",
+        "tp_sync": "🎯 <b>TP synced</b>",
+        "single": "↪️ <b>No margin for copies - the trade stays as you opened it (no ladder TP/SL)</b>",
         "sl_cleared": "🚫 <b>Stop removed from all trades</b>",
         "be": "🔒 <b>TP1 hit - stop moved</b>",
         "lock_tp1": "🔐 <b>Price ran on - stop to TP1</b>",
@@ -621,12 +625,6 @@ class LadderManager:
             return
         levels = self._tp_levels(pos["price"], pos["side"], count)
         sl, auto = self._auto_sl(pos["sl"], pos["price"], pos["side"])
-        # one PATCH sets SL and TP together (a missing field clears it); a TP whose order hasn't arrived yet
-        # is left alone - the group's SL sync gives that trade the SL
-        if not pos["has_tp"] and levels[0] is not None:
-            self.pool.submit(self._protect, pos, sl, levels[0])
-        elif auto and pos["tp"] is not None:
-            self.pool.submit(self._protect, pos, sl, pos["tp"])
         futures = [self.pool.submit(self._market, pos["side"], per, tp, sl, tag) for tp in levels[1:]]
         opened = 1
         errors = []
@@ -638,10 +636,22 @@ class LadderManager:
                 errors.append(str(exc)[:300])
         if errors:
             self._broadcast(self._t("error"), errors[:1])
+        if opened == 1 and not reduce:
+            # no copy opened (a trade on the whole account: no margin left for copies): it is not a ladder, so the
+            # user's own SL/TP stay as they are - no TP1, no auto SL, no group
+            self._broadcast(self._t("single"), [f"{pos['side']} {pos['qty']} @ {pos['price']}"])
+            return
+        # one PATCH sets SL and TP together (a missing field clears it); a TP whose order hasn't arrived yet
+        # is left alone - the group's SL sync gives that trade the SL
+        if not pos["has_tp"] and levels[0] is not None:
+            self.pool.submit(self._protect, pos, sl, levels[0])
+        elif auto and pos["tp"] is not None:
+            self.pool.submit(self._protect, pos, sl, pos["tp"])
         self.state["groups"][tag] = {
             "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"],
             "target_sl": sl if self.p["sync_sl"] else None, "seen_sl": {}, "max_members": 0, "be_stage": 0,
             "tp1": levels[0], "step": self.p["tp_step"], "cfg": {k: self.p[k] for k in GROUP_KEYS},
+            "sl_auto": auto,
         }
         self._broadcast(self._t("ladder"), [
             f"{self._t('side')}: {pos['side']}  {self._lot_line(pos['qty'], count, per, reduce, opened)}",
@@ -771,8 +781,10 @@ class LadderManager:
     # ==================================================================
     # Open groups: SL sync, BE after TP1, cleanup
     # ==================================================================
-    def _set_sl(self, member, target, now):
+    def _set_sl(self, member, target, now, tp=None):
+        """tp: the TP to send along (the PATCH replaces both) - the group's synced TP, not a stale one."""
         pid = member["id"]
+        tp = tp if tp is not None else member["tp"]
         if pid in self.sl_pending:
             sent_target, sent_at, attempts = self.sl_pending[pid]
             if self._same(sent_target, target) and now - sent_at < self.p["sl_retry_seconds"]:
@@ -791,7 +803,7 @@ class LadderManager:
                 ok = self._modify_order(member["sl_id"], {"stopPrice": target})
                 via = "order"
             else:
-                ok = self._protect(member, target, member["tp"])
+                ok = self._protect(member, target, tp)
                 via = "position"
         except Exception as exc:    # e.g. the server refuses an SL the price already passed - retried next round
             ok, via = f"refused: {str(exc)[:120]}", "error"
@@ -919,6 +931,40 @@ class LadderManager:
             return g["runner_sl"]
         return g["target_sl"]
 
+    def _sync_tp(self, g, members, now):
+        """The user moved the TP of one trade (not the runner): every trade with a TP gets that same price, so they
+        all close together there. The runner (no TP) stays without one."""
+        seen = g.setdefault("seen_tp", {})
+        changed_to = None
+        for m in members:
+            prev = seen[m["id"]] if m["id"] in seen else "unseen"
+            if prev not in ("unseen", None) and m["tp"] is not None and not self._same(prev, m["tp"]) \
+                    and not ("target_tp" in g and self._same(m["tp"], g["target_tp"])):
+                changed_to = m["tp"]
+            seen[m["id"]] = m["tp"]
+        if changed_to is not None:
+            g["target_tp"] = changed_to
+            g["tp_sent"] = {}
+            self._broadcast(self._t("tp_sync"), [f"TP: {changed_to}", f"{self._t('count')}: "
+                                                 f"{sum(1 for m in members if m['tp'] is not None)}"])
+        if "target_tp" not in g:
+            return
+        calls = []
+        for m in members:
+            if m["tp"] is None or self._same(m["tp"], g["target_tp"]):
+                continue
+            sent = g["tp_sent"][m["id"]] if m["id"] in g["tp_sent"] else 0
+            if now - sent < self.p["sl_retry_seconds"]:
+                continue
+            g["tp_sent"][m["id"]] = now
+            sl = self._want_sl(g, m)
+            calls.append(self.pool.submit(self._protect, m, sl if sl is not None else m["sl"], g["target_tp"]))
+        for c in calls:
+            try:
+                c.result()
+            except Exception as exc:     # e.g. a TP the price already passed - tried again next round
+                log.info(f"set TP -> {g['target_tp']} refused: {str(exc)[:120]}")
+
     def _handle_open_groups(self, positions):
         now = time.time()
         for tag, g in list(self.state["groups"].items()):
@@ -951,6 +997,11 @@ class LadderManager:
                 removed = False
                 for m in members:
                     prev = g["seen_sl"][m["id"]] if m["id"] in g["seen_sl"] else "unseen"
+                    if prev == "unseen" and m["id"] == g["parent"] and "sl_auto" in g and g["sl_auto"] \
+                            and m["sl"] is not None and not self._same(m["sl"], g["target_sl"]):
+                        # the user's own SL reached the server after the trade did (the ladder saw it without one
+                        # and planned an auto SL): the user's SL wins and goes to all of them
+                        changed_to = m["sl"]
                     if prev != "unseen" and not self._same(prev, m["sl"]):
                         if m["sl"] is not None and (clear or not self._same(m["sl"], self._want_sl(g, m))):
                             changed_to = m["sl"]
@@ -968,6 +1019,9 @@ class LadderManager:
                     g["target_sl"] = None
                     g["clear_sl"] = clear = True
                     self._broadcast(self._t("sl_cleared"), [f"{self._t('count')}: {len(members)}"])
+            g["sl_auto"] = False
+
+            self._sync_tp(g, members, now)
 
             if self._c(g, "be_after_tp1") and g["max_members"] >= 2:
                 clear = self._move_after_tp1(g, members, clear)
@@ -977,7 +1031,8 @@ class LadderManager:
                 for m in members:
                     want = self._want_sl(g, m)
                     if not self._same(m["sl"], want):
-                        calls.append(self.pool.submit(self._set_sl, m, want, now))
+                        tp = g["target_tp"] if "target_tp" in g and m["tp"] is not None else None
+                        calls.append(self.pool.submit(self._set_sl, m, want, now, tp))
                     elif m["id"] in self.sl_pending:
                         del self.sl_pending[m["id"]]
                 for c in calls:
