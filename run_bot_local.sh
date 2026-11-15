@@ -11,6 +11,6 @@ export DISCORD_WEBHOOK="$(security find-generic-password -s discord-webhook-ladd
 export DISCORD_WEBHOOK_ALERT="$(security find-generic-password -s discord-webhook-ladder -w)"
 export LADDER_DISCORD_TOKEN="$(security find-generic-password -s ladder-discord-token -w)"
 export CONTROL_CHANNEL_ID="1567907244413165678" ALLOWED_USER_ID="828546772547797012"
-export ACCOUNT_NOTES="590661=מועתק 1:1 ל-Colmex live"
+export ACCOUNT_NOTES="595458=מועתק ל-Atrade 1:1 ול-Colmex לפי יתרה"
 export DATA_DIR="${DATA_DIR:-$PWD/data}"
 exec .venv/bin/python -u bot.py "$@"

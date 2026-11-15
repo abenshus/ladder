@@ -4,8 +4,8 @@ cd "$(dirname "$0")"
 [ -d .venv ] || { python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt; }
 export TL_ENV="https://rba-demo.tradelocker.com"
 export TL_SERVER="8CAP"
-# 590661 is copied 1:1 to Colmex live by MetaCopier - test on 595458 (not copied)
-export TL_ACCOUNT_ID="${TL_ACCOUNT_ID:-595458}"
+# 595458 is a MetaCopier master (2026-11-15: Atrade 1:1, Colmex by balance) - test on 590661 (its copiers are off)
+export TL_ACCOUNT_ID="${TL_ACCOUNT_ID:-590661}"
 export TL_EMAIL="$(security find-generic-password -a "$USER" -s tradelocker-demo-email -w)"
 export TL_PASSWORD="$(security find-generic-password -a "$USER" -s tradelocker-demo-password -w)"
 export TL_DEV_KEY="$(security find-generic-password -s tradelocker-dev-api-key -w 2>/dev/null)"

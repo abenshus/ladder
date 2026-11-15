@@ -52,4 +52,4 @@ DISCORD_WEBHOOK DISCORD_WEBHOOK_ALERT ACCOUNT_NOTES`. Secrets are in the Keychai
 `ladder-discord-token`, `discord-webhook-ladder*`).
 
 Accounts: demo ones by id ("590661"), live ones as "live:<id>" (same login on rba-live; switching to live always asks first).
-Demo 590661 is copied 1:1 to Colmex live by MetaCopier — everything laddered there is real money on Colmex.
+Demo 595458 is a MetaCopier master (2026-11-15): copied 1:1 to Atrade and by balance ratio to Colmex live — everything laddered there is real money. Test on demo 590661 (its copiers are off; check the #copier panel before testing).
