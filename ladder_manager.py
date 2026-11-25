@@ -86,8 +86,9 @@ PARAMS = dict(
     manual_tags="",             # strategyId נוספים שנחשבים ידני, מופרדים בפסיק (בדיקות: key-undefined = API בלי strategy)
     tp_hit_slack=0.3,           # עסקה שנעלמה נחשבת TP אם המחיר הכי טוב שנראה הגיע עד כדי כך ל-TP שלה (המחיר נדגם כל ~2 שניות)
     sl_retry_seconds=4.0,       # אם ה-SL לא התעדכן אחרי X שניות - מנסים שוב / דרך אחרת
-    cmd_off_price=1000.0,       # Buy Limit בדיוק במחיר הזה (מהמסחר) = כיבוי; השירות מוחק את ההזמנה (0 = בלי)
-    cmd_on_price=2000.0,        # Buy Limit בדיוק במחיר הזה = הדלקה
+    cmd_off_price=2000.0,       # Buy Limit בדיוק במחיר הזה (מהמסחר) = כיבוי; השירות מוחק את ההזמנה (0 = בלי)
+    cmd_on_price=1000.0,        # Buy Limit במחיר 1ABC = הדלקה; A = סטופ אוטומטי $, B = עסקאות (1 = 10), C.xx = מרווח TP $;
+                                # 0 = בלי שינוי (1000 = רק להדליק). למשל 1572 = SL 5$, 7 עסקאות, TP כל 2$; 1571.5 = TP כל 1.5$
 )
 
 TRANSLATIONS = {
@@ -114,6 +115,7 @@ TRANSLATIONS = {
         "cmd_off": "🔴 <b>כובה מהמסחר</b>",
         "cmd_on": "🟢 <b>הופעל מהמסחר</b>",
         "cmd_same": "כבר היה במצב הזה",
+        "cmd_set": "SL {auto_sl:g}$ · {copies} עסקאות · TP כל {tp_step:g}$",
         "cmd_left": "ההזמנה לא נמחקה - מחק אותה בעצמך",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
@@ -142,6 +144,7 @@ TRANSLATIONS = {
         "cmd_off": "🔴 <b>Turned off from the terminal</b>",
         "cmd_on": "🟢 <b>Turned on from the terminal</b>",
         "cmd_same": "was already so",
+        "cmd_set": "SL {auto_sl:g}$ · {copies} trades · TP every {tp_step:g}$",
         "cmd_left": "the order was not deleted - delete it yourself",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
@@ -1305,37 +1308,55 @@ class LadderManager:
         }
 
     def _command(self, o):
-        """True/False for an on/off command order: the user's Buy Limit at exactly cmd_on_price / cmd_off_price."""
+        """(on, changes) for a command order (the user's Buy Limit), else None.
+        Exactly cmd_off_price = off. cmd_on_price + ABC (1000-1999.99) = on, with digits as settings (0 = keep):
+        A = auto_sl $, B = copies (1 = 10), C plus the fraction = tp_step $ (1571.5 = 1.5$)."""
         if not (o["open"] and o["type"] == "limit" and o["side"] == "buy" and self._is_manual(o["strategy"])):
             return None
-        for price, value in ((self.p["cmd_off_price"], False), (self.p["cmd_on_price"], True)):
-            if price and abs(o["price"] - price) < 0.005:
-                return value
-        return None
+        cents = round(o["price"] * 100)
+        off, on = round(self.p["cmd_off_price"] * 100), round(self.p["cmd_on_price"] * 100)
+        if off and cents == off:
+            return False, {}
+        if not on or not on <= cents < on + 100000:
+            return None
+        code = cents - on               # ABC.xx in cents
+        a, b, step = code // 10000, code // 1000 % 10, code % 1000 / 100
+        changes = {}
+        if a:
+            changes["auto_sl"] = float(a)
+        if b:
+            changes["copies"] = 10 if b == 1 else b
+        if step:
+            changes["tp_step"] = step
+        return True, changes
 
     def _commands(self, pending):
-        """Turn on/off from the terminal: act on a command order, delete it (the sign it was done) and never ladder it."""
+        """On/off (and settings) from the terminal: act on a command order, delete it (the sign it was done), never ladder it."""
         self.cmd_done = {x for x in self.cmd_done if x in pending}
         rest = {}
         for oid, o in pending.items():
-            value = self._command(o)
-            if value is None:
+            cmd = self._command(o)
+            if cmd is None:
                 rest[oid] = o
                 continue
             if oid in self.cmd_done:
                 continue
             self.cmd_done.add(oid)
-            same = self.p["enabled"] == value
+            value, changes = cmd
+            same = self.p["enabled"] == value and all(self.p[k] == v for k, v in changes.items())
             if self.on_command:
-                self.on_command(value)      # the Discord panel saves it and shows it
+                self.on_command(value, changes)     # the Discord panel saves it and shows it
             else:
                 self.p["enabled"] = value
+                self.p.update(changes)
             try:
                 deleted = self._retry_429(self._delete_order, oid)
             except Exception as exc:
                 log.warning(f"delete command order {oid}: {exc}")
                 deleted = False
             lines = [f"Buy Limit @{o['price']:g} · #{oid}"]
+            if value:
+                lines.append(self._t("cmd_set").format(**self.p))
             if same:
                 lines.append(self._t("cmd_same"))
             if not deleted:
@@ -1344,7 +1365,7 @@ class LadderManager:
         return rest
 
     summary = None      # last tick's view, read by the Discord panel
-    on_command = None   # set by the Discord panel: called with True/False when a command order turns it on/off
+    on_command = None   # set by the Discord panel: (on, settings) when a command order turns it on/off
     on_alert = None     # set by the Discord panel: (header, lines) of errors / startup
 
     def _single_instance(self):
