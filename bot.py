@@ -328,7 +328,8 @@ class Engine:
         self.stop_engine()
         if not account:
             return
-        self.params["max_total_lots"] = self.limit(account)
+        self.params["max_risk_pct"] = self.limit(account)
+        self.params["max_total_lots"] = 0.0     # replaced by max_risk_pct (an old ounces cap is ignored)
         self.params["label"] = f"{self.name} · {account_label(account)}"
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._supervise, args=(str(account), self.stop), daemon=True)
@@ -365,14 +366,15 @@ class Engine:
             stop.wait(15)
 
     def limit(self, account):
-        limits = self.settings.data["limits"]
+        """Max risk of a whole ladder on this account, % of the balance at the original SL (0 = none)."""
+        limits = self.settings.data.setdefault("risk_limits", {})
         return float(limits[account]) if account in limits else 0.0
 
-    def set_limit(self, account, lots):
-        self.settings.data["limits"][account] = lots
+    def set_limit(self, account, pct):
+        self.settings.data.setdefault("risk_limits", {})[account] = pct
         self.settings.save()
         if account == self.account:
-            self.params["max_total_lots"] = lots
+            self.params["max_risk_pct"] = pct
 
     def set(self, key, value):
         self.params[key] = value
@@ -474,7 +476,7 @@ GUIDE = [
     ("🎛 הכפתורים", 0x95a5a6, """\
 🟢 **הדלק / 🔴 כבה** - כבוי = לא משכפל עסקאות **חדשות**. קבוצות שכבר פתוחות ממשיכות לקבל סנכרון סטופ.
 גם מהמסחר (זהב, כל לוט): **Buy Limit 2000 = כבה**, **Buy Limit 1ABC = הדלק** - וכל ספרה היא הגדרה (0 = בלי שינוי): A = סטופ אוטומטי $, B = עסקאות (1 = 10), C = מרווח TP $ (שבר: 1571.5 = 1.5$). למשל **1572** = SL 5$, 7 עסקאות, TP כל 2$; **1000** = רק להדליק. ההגדרות נשמרות; מצב 🔒 לא משתנה. ההזמנה נמחקת תוך כמה שניות - זה הסימן שבוצע; אם היא נשארה, השרת לא קיבל אותה.
-⚙️ **הגדרות** - כמה עסקאות בסולם (2-10), מרחק בין TP-ים בדולרים, ומקסימום אונקיות לכל הסולם בחשבון.
+⚙️ **הגדרות** - כמה עסקאות בסולם (2-10), מרחק בין TP-ים בדולרים, וסיכון מקסימלי לסולם באחוז מהיתרה (הלדר מחשב לבד כמה אונקיות מותר לפי ה-SL המקורי; אם העסקה שלך לבד מעל - בלי עותקים + התראה).
 🛡 **סטופ** - סטופ אוטומטי (עסקה שנפתחה בלי SL מקבלת SL במרחק הזה, למשל 10$), BE offset (כמה מעבר לכניסה \
 הסטופ נכנס, למשל 0.5$ = נועל 0.5$ לאונקיה), ונעילת TP1 במצב "שני שלבים".
 🔄 **רענן** - טוען מחדש את רשימת החשבונות.
@@ -536,7 +538,7 @@ def panel_embed(engine):
     on = p["enabled"] and bool(key)
     acc = account_label(key) if key else "—"
     note = account_notes().get(split_key(key)[1]) if key else None
-    cap = p["max_total_lots"]
+    cap = p["max_risk_pct"] if "max_risk_pct" in p else 0.0
     lines = [
         "🟢 **פועל** - משכפל עסקאות חדשות" if on
         else "⚪ **בחר חשבון** בתפריט למטה" if not key
@@ -551,7 +553,7 @@ def panel_embed(engine):
         "**סטופ אוטומטי:** " + (f"{p['auto_sl']:g}$ מהכניסה לעסקה שנפתחה בלי SL" if p["auto_sl"] else "בלי"),
         "**סטופ אחרי TP:** " + after_tp1_text(p),
         f"**מחיקת SL מעסקה:** {'מוחקת מכולן' if p['sync_sl_delete'] else 'מחזירה לה את ה-SL'}",
-        f"**הגבלה לחשבון:** " + (f"{cap * 100:g} אונקיות לכל הסולם" if cap else "בלי הגבלה"),
+        f"**סיכון מקסימלי לסולם:** " + (f"{cap:g}% מהיתרה עד ה-SL המקורי" if cap else "בלי הגבלה"),
         "",
     ]
     groups = engine.open_groups()
@@ -579,10 +581,10 @@ class SettingsModal(discord.ui.Modal):
         p = panel.engine.params
         self.copies = discord.ui.TextInput(label="כמה עסקאות בסך הכול (2-10)", default=str(p["copies"]), max_length=2)
         self.tp_step = discord.ui.TextInput(label="מרחק בין TP-ים בדולרים", default=str(p["tp_step"]), max_length=6)
-        # in ounces: "20" is 20 oz (0.2 lot) - lots invited typing 20 for 20 oz
-        self.max_oz = discord.ui.TextInput(label="מקסימום אונקיות לכל הסולם (0 = בלי הגבלה)",
-                                           default=f"{p['max_total_lots'] * 100:g}", max_length=6)
-        for item in (self.copies, self.tp_step, self.max_oz):
+        self.max_risk = discord.ui.TextInput(label="סיכון מקסימלי לסולם (% מהיתרה, 0 = בלי)",
+                                             default=f"{panel.engine.limit(panel.engine.account):g}"
+                                             if panel.engine.account else "0", max_length=5)
+        for item in (self.copies, self.tp_step, self.max_risk):
             self.add_item(item)
 
     async def on_submit(self, interaction):
@@ -590,23 +592,22 @@ class SettingsModal(discord.ui.Modal):
         try:
             copies = int(self.copies.value)
             tp_step = float(self.tp_step.value)
-            max_oz = float(self.max_oz.value)
-            max_lots = round(max_oz / 100, 2)
+            max_risk = float(self.max_risk.value.replace("%", "").strip())
             if not 2 <= copies <= 10 or not 0.1 <= tp_step <= 100 or not p["be_offset"] < tp_step \
-                    or not 0 <= max_oz <= 500:
+                    or not 0 <= max_risk <= 100:
                 raise ValueError
         except ValueError:
             await interaction.response.send_message(
                 f"ערכים לא תקינים: עסקאות 2-10, מרחק TP 0.1-100 (וגדול מ-BE offset {p['be_offset']:g}$), "
-                "מקסימום אונקיות 0-500.", ephemeral=True)
+                "סיכון 0-100%.", ephemeral=True)
             return
         account = self.panel.engine.account
         if account:
-            self.panel.engine.set_limit(account, max_lots)
+            self.panel.engine.set_limit(account, max_risk)
         self.panel.engine.set("copies", copies)
         self.panel.engine.set("tp_step", tp_step)
-        cap = f"{max_oz:g} אונקיות" if max_lots else "בלי"
-        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · הגבלה {cap}")
+        cap = f"{max_risk:g}% מהיתרה" if max_risk else "בלי"
+        await self.panel.confirm(interaction, f"✅ ההגדרות נשמרו: {copies} עסקאות · TP כל {tp_step:g}$ · סיכון מקסימלי {cap}")
 
 
 class StopModal(discord.ui.Modal):
@@ -689,7 +690,7 @@ class AccountSelect(discord.ui.Select):
             warn.append(f"⚠️ **{account_label(account)} הוא חשבון אמיתי - כסף אמיתי.** "
                         f"המצב עכשיו: {'🟢 דלוק' if p['enabled'] else '🔴 כבוי'}, "
                         f"{'שכפול' if p['mode'] == 'duplicate' else 'חלוקה'} × {p['copies']}, "
-                        f"הגבלה: {f'{cap * 100:g} אונקיות' if cap else 'בלי'}.")
+                        f"סיכון מקסימלי: {f'{cap:g}% מהיתרה' if cap else 'בלי'}.")
         if warn:
             await interaction.response.send_message("\n".join(warn) + "\nלהחליף?",
                                                     view=ConfirmSwitch(self.panel, account), ephemeral=True)

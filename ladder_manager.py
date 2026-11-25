@@ -62,6 +62,9 @@ PARAMS = dict(
     mode="duplicate",           # "duplicate" = כל עסקה בלוט שלך | "split" = הלוט שלך מתחלק ל-copies עסקאות
     copies=5,                   # כמה עסקאות בסך הכול (כולל שלך)
     max_total_lots=0.0,         # duplicate: כמה לוט מקסימום בכל הסולם (0 = בלי). אם עובר - העותקים קטנים כדי להישאר בפנים
+    max_risk_pct=0.0,           # duplicate: כל הסולם מסכן עד X% מהיתרה עד ה-SL המקורי (0 = בלי). מחליף את max_total_lots;
+                                # העותקים קטנים / פחות עותקים; אם העסקה שלך לבד מעל - בלי עותקים + התראה
+    risk_slip=0.5,              # max_risk_pct: מרווח החלקה שמתווסף ל-SL בחישוב ($ במחיר)
     lot_step=0.01,              # split: הלוט הכי קטן; אם אין מספיק ל-copies - פחות עסקאות, השארית אצלך
     tp_step=2.0,                # מרווח בין ה-TP-ים (דולר במחיר)
     runner_last=True,           # העסקה האחרונה בלי TP
@@ -103,6 +106,7 @@ TRANSLATIONS = {
         "tp_sync": "🎯 <b>TP סונכרן</b>",
         "manual_sl": "✋ <b>נתת לסטופ אוויר - המדרגות האוטומטיות נעצרו בסולם הזה</b>",
         "single": "↪️ <b>אין מרווח לעותקים - העסקה נשארת כמו שפתחת (בלי TP/SL של הסולם)</b>",
+        "over_risk": "⚠️ <b>העסקה שלך לבד כבר מעל הסיכון המקסימלי - לא נפתחו עותקים</b>",
         "sl_cleared": "🚫 <b>סטופ נמחק מכל העסקאות</b>",
         "be": "🔒 <b>TP1 נתפס - סטופ הוזז</b>",
         "lock_tp1": "🔐 <b>המחיר המשיך - סטופ ל-TP1</b>",
@@ -119,7 +123,7 @@ TRANSLATIONS = {
         "cmd_left": "ההזמנה לא נמחקה - מחק אותה בעצמך",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
-        "auto": "אוטומטי", "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
+        "auto": "אוטומטי", "no_sl": "אין SL - הסיכון בלי גבול", "no_balance": "היתרה לא ידועה", "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
     },
     "en": {
         "start": "🚀 Ladder Manager started",
@@ -132,6 +136,7 @@ TRANSLATIONS = {
         "tp_sync": "🎯 <b>TP synced</b>",
         "manual_sl": "✋ <b>You gave the stop room - automatic steps stopped for this ladder</b>",
         "single": "↪️ <b>No margin for copies - the trade stays as you opened it (no ladder TP/SL)</b>",
+        "over_risk": "⚠️ <b>Your trade alone is over the max risk - no copies opened</b>",
         "sl_cleared": "🚫 <b>Stop removed from all trades</b>",
         "be": "🔒 <b>TP1 hit - stop moved</b>",
         "lock_tp1": "🔐 <b>Price ran on - stop to TP1</b>",
@@ -148,7 +153,7 @@ TRANSLATIONS = {
         "cmd_left": "the order was not deleted - delete it yourself",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
-        "auto": "auto", "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
+        "auto": "auto", "no_sl": "no SL - unlimited risk", "no_balance": "balance unknown", "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
     },
 }
 
@@ -191,6 +196,7 @@ class StreamFeed:
         self.filled = {}        # entry order id -> position id
         self.tp_closed = {}     # position id -> time its TP (closing limit order) filled
         self.pnl = {}           # pid -> open PnL in USD (AccountStatus.positionPnLs)
+        self.balance = None     # AccountStatus.balance when the stream sends it
 
     @property
     def alive(self):
@@ -246,6 +252,10 @@ class StreamFeed:
                 self.synced = True
             elif kind == "AccountStatus":
                 self.pnl = {x["positionId"]: x["pnl"] for x in m.get("positionPnLs") or []}
+                try:
+                    self.balance = float(m["balance"]) if "balance" in m else self.balance
+                except (TypeError, ValueError):
+                    pass
             elif kind == "Position" and m.get("instrument") == self.symbol:
                 pid = m["positionId"]
                 self.positions[pid] = m
@@ -326,6 +336,8 @@ class LadderManager:
         # runtime only: member -> (target_sl, sent_at, attempts)
         self.sl_pending = {}
         self.feed = None
+        self._bal, self._bal_at = None, 0.0     # REST balance cache for max_risk_pct
+        self.cap_note = ""      # how the last _plan's max_risk_pct cap was computed (for the log line)
         # each order/modify call takes ~1.3s on the server; send a group's calls together (limit 5/s)
         self.pool = ThreadPoolExecutor(max_workers=5)
         self.first_seen = {}    # pid -> time first seen (stream: SL/TP orders arrive right after the Position)
@@ -386,21 +398,58 @@ class LadderManager:
             return count, 0.0
         return count, round((units // count) * step, 2)
 
-    def _plan(self, qty):
+    def _balance(self):
+        """Account balance for max_risk_pct: from the stream's AccountStatus when it has it, else REST (cached 20s)."""
+        if self.feed and self.feed.balance:
+            return self.feed.balance
+        if time.time() - self._bal_at > 20:
+            try:
+                self._bal = float(self.api.get_account_state()["balance"])
+                self._bal_at = time.time()
+            except Exception as exc:
+                log.warning(f"balance unavailable for max_risk_pct: {exc}")
+        return self._bal
+
+    def _risk_cap(self, sl_dist):
+        """Max lots of the whole ladder so that a stop at the original SL (+ risk_slip) loses max_risk_pct of the
+        balance; None when max_risk_pct is off or unknown (no SL / no balance - then max_total_lots applies)."""
+        pct = self.p["max_risk_pct"]
+        self.cap_note = ""
+        if not pct:
+            return None
+        if not sl_dist:
+            # no SL (and auto_sl off): the risk has no limit - never add copies to it
+            self.cap_note = f"{pct:g}% · {self._t('no_sl')}"
+            return 0.0
+        balance = self._balance()
+        if not balance:
+            self.cap_note = f"{pct:g}% · {self._t('no_balance')}"
+            return 0.0
+        loss = (sl_dist + self.p["risk_slip"]) * 100          # $ per lot at the SL (1 lot = 100 oz)
+        lots = int(balance * pct / 100 / loss / self.p["lot_step"] + 1e-9) * self.p["lot_step"]
+        self.cap_note = f"{pct:g}% × {balance:,.0f}$ ÷ SL {sl_dist + self.p['risk_slip']:g}$ = {lots * 100:g} oz"
+        return round(lots, 2)
+
+    def _plan(self, qty, sl_dist=None):
         """(number of trades, size of each copy, how much to take off the user's trade).
-        duplicate + max_total_lots: when copies of the same size would pass the cap, the room left under it is
-        divided between the copies; with no room at all the user's own lot is split instead."""
+        duplicate + cap (max_risk_pct of the balance at the original SL, else max_total_lots): when copies of the
+        same size would pass the cap, the room left under it is divided between the copies (smaller copies first,
+        fewer copies when even one lot step each doesn't fit). With no room at all: under max_risk_pct the user's
+        trade stays alone (count 1); under max_total_lots the user's own lot is split instead."""
         step = self.p["lot_step"]
-        cap = self.p["max_total_lots"]
+        risk_cap = self._risk_cap(sl_dist) if self.p["mode"] != "split" else None
+        cap = risk_cap if risk_cap is not None else self.p["max_total_lots"]
         if self.p["mode"] != "split":
             count = self.p["copies"]
-            if not cap or qty * count <= cap + 1e-9:
+            if risk_cap is None and not cap or qty * count <= cap + 1e-9:
                 return count, qty, 0.0
             room = int((cap - qty) / step + 1e-9)       # whole lot steps left under the cap
             if room >= 1:
                 extra = min(count - 1, room)
                 per = min(room // extra, int(round(qty / step)))
                 return extra + 1, round(per * step, 2), 0.0
+            if risk_cap is not None:
+                return 1, 0.0, 0.0
         count, per = self._split_sizes(qty)
         return count, per, round(per * (count - 1), 2)
 
@@ -619,7 +668,8 @@ class LadderManager:
 
     def _lot_line(self, qty, count, per, reduce, opened=None):
         done = f"{opened}/{count}" if opened is not None else f"{count}"
-        cap = f"  ({self._t('cap')} {self.p['max_total_lots'] * 100:g} oz)" if self.p["max_total_lots"] else ""
+        cap = f"  ({self._t('cap')} {self.cap_note})" if self.cap_note \
+            else f"  ({self._t('cap')} {self.p['max_total_lots'] * 100:g} oz)" if self.p["max_total_lots"] else ""
         if reduce:
             return f"{self._t('qty')}: {qty} → {done} × {per}{cap}"
         if per == qty:
@@ -632,7 +682,16 @@ class LadderManager:
     # ==================================================================
     def _ladder_position(self, pos):
         tag = f"{self.p['strategy_tag']}-{pos['id']}"
-        count, per, reduce = self._plan(pos["qty"])
+        sl, auto = self._auto_sl(pos["sl"], pos["price"], pos["side"])
+        count, per, reduce = self._plan(pos["qty"], abs(pos["price"] - sl) if sl else None)
+        if count < 2 and self.cap_note:
+            # max_risk_pct: the user's trade alone already risks more than allowed - leave it as it is, no copies
+            self._single_group(tag, pos)
+            self._broadcast(self._t("over_risk"), [
+                f"{pos['side']} {pos['qty']} @ {pos['price']} · SL {sl or '—'}",
+                f"{self._t('cap')} {self.cap_note}",
+            ])
+            return
         if count < 2:
             self._broadcast(self._t("error"), [f"{self._t('qty')} {pos['qty']}: < 2 × {self.p['lot_step']}"])
             return
@@ -640,7 +699,6 @@ class LadderManager:
             self._broadcast(self._t("error"), [f"partial close {reduce} failed - no copies opened"])
             return
         levels = self._tp_levels(pos["price"], pos["side"], count)
-        sl, auto = self._auto_sl(pos["sl"], pos["price"], pos["side"])
         futures = [self.pool.submit(self._market, pos["side"], per, tp, sl, tag) for tp in levels[1:]]
         opened = 1
         errors = []
@@ -656,11 +714,7 @@ class LadderManager:
             # no copy opened (a trade on the whole account: no margin left for copies): it is not a ladder, so the
             # user's own SL/TP stay as they are - no TP1, no auto SL. A one-trade group only watches its SL, so the
             # terminal's break-even button still gets be_offset (see _be_click)
-            self.state["groups"][tag] = {
-                "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"], "target_sl": None,
-                "seen_sl": {}, "max_members": 0, "be_stage": 0, "tp1": None, "step": self.p["tp_step"],
-                "cfg": {k: self.p[k] for k in GROUP_KEYS}, "single": True,
-            }
+            self._single_group(tag, pos)
             self._broadcast(self._t("single"), [f"{pos['side']} {pos['qty']} @ {pos['price']}"])
             return
         # one PATCH sets SL and TP together (a missing field clears it); a TP whose order hasn't arrived yet
@@ -682,6 +736,13 @@ class LadderManager:
             f"{self._t('sl')}: {sl or '—'}" + (f" ({self._t('auto')})" if auto else ""),
         ])
 
+    def _single_group(self, tag, pos):
+        self.state["groups"][tag] = {
+            "kind": "open", "side": pos["side"], "entry": pos["price"], "parent": pos["id"], "target_sl": None,
+            "seen_sl": {}, "max_members": 0, "be_stage": 0, "tp1": None, "step": self.p["tp_step"],
+            "cfg": {k: self.p[k] for k in GROUP_KEYS}, "single": True,
+        }
+
     def _adopt_group(self, tag, pos):
         log.info(f"adopting existing ladder {tag}")
         self.state["groups"][tag] = {
@@ -693,13 +754,19 @@ class LadderManager:
     def _ladder_pending(self, order):
         tag = f"{self.p['strategy_tag']}-O{order['id']}"
         entry = order["price"] if order["type"] == "limit" else order["stop_price"]
-        count, per, reduce = self._plan(order["qty"])
+        sl, auto = self._auto_sl(order["sl"], entry, order["side"])
+        count, per, reduce = self._plan(order["qty"], abs(entry - sl) if sl else None)
+        if count < 2 and self.cap_note:
+            self._broadcast(self._t("over_risk"), [
+                f"{order['type']} {order['side']} {order['qty']} @ {entry} · SL {sl or '—'}",
+                f"{self._t('cap')} {self.cap_note}",
+            ])
+            return
         if count < 2:
             self._broadcast(self._t("error"), [f"{self._t('qty')} {order['qty']}: < 2 × {self.p['lot_step']}"])
             return
         levels = self._tp_levels(entry, order["side"], count)
         tp1 = order["tp"] or levels[0]
-        sl, auto = self._auto_sl(order["sl"], entry, order["side"])
         if reduce:
             # modify replaces the order's SL/TP too, so send them with the new size
             params = {"qty": str(round(order["qty"] - reduce, 2))}
@@ -1456,6 +1523,8 @@ def main():
     ap.add_argument("--be", action="store_true", help="after TP1 move the others' SL to entry")
     ap.add_argument("--be-offset", type=float, help="BE this many dollars past entry")
     ap.add_argument("--max-lots", type=float, help="duplicate: cap on the whole ladder's lots (copies shrink to fit)")
+    ap.add_argument("--max-risk-pct", type=float,
+                    help="duplicate: the whole ladder risks at most this %% of the balance at the original SL")
     ap.add_argument("--no-runner", action="store_true", help="last trade gets a TP too")
     ap.add_argument("--keep-sl-on-delete", action="store_true",
                     help="deleting one trade's SL puts the group SL back instead of removing it from all")
@@ -1475,7 +1544,8 @@ def main():
     if args.active:
         params["active"] = True
     for key, value in (("mode", args.mode), ("copies", args.copies), ("tp_step", args.tp_step),
-                       ("be_offset", args.be_offset), ("max_total_lots", args.max_lots)):
+                       ("be_offset", args.be_offset), ("max_total_lots", args.max_lots),
+                       ("max_risk_pct", args.max_risk_pct)):
         if value is not None:
             params[key] = value
     if args.be:

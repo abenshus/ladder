@@ -3,8 +3,10 @@
 Turns one manual TradeLocker trade into a ladder of trades with stepped take-profits, and keeps their stop-loss in sync.
 
 - **split**: your lot is divided — open 0.1, get 5 × 0.02 (your trade is partially closed, 4 copies open).
-- **duplicate** (default): every trade gets your lot — open 0.02, get 5 × 0.02. `max_total_lots` (per account) shrinks the copies
-  so the whole ladder stays under the cap.
+- **duplicate** (default): every trade gets your lot — open 0.02, get 5 × 0.02. `max_risk_pct` (per account, panel ⚙️) caps the
+  whole ladder's risk at the original SL (+ `risk_slip`) to that % of the balance: max lots = pct × balance ÷ ((SL + slip) × 100).
+  Copies shrink first, then fewer copies; if your trade alone is over it, no copies + a warning (your trade is never touched).
+  The SL moved later doesn't change it. `max_total_lots` (fixed lots, CLI) is used only when `max_risk_pct` is 0.
 - TPs every `tp_step` dollars, the last trade without a TP (runner) unless turned off.
 - Move the SL of any trade → all get it within ~2s. Delete it → removed from all (or restored, `sync_sl_delete=False`).
 - Move the TP of any trade that has one → all trades with a TP get that same price (they close together there); the runner stays without a TP.
