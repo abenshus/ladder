@@ -315,6 +315,11 @@ class Engine:
         else:
             self.note(f"{header}: {' · '.join(lines)[:300]}")
 
+    def _command(self, value):
+        """A Buy Limit at 1000 / 2000 in the terminal (manager thread): same as the panel's off / on buttons."""
+        self.set("enabled", value)
+        self.note("🟢 הופעל מהמסחר (הזמנה 2000)" if value else "🔴 כובה מהמסחר (הזמנה 1000)")
+
     def start(self, account):
         self.stop_engine()
         if not account:
@@ -340,6 +345,7 @@ class Engine:
             try:
                 self.manager = lm.LadderManager(self.params, state_file, account_id=acc_id, stop_event=stop, login=login)
                 self.manager.on_alert = self._alert
+                self.manager.on_command = self._command
                 self.error = ""
                 self.manager.run()
             except RuntimeError as exc:
@@ -463,6 +469,7 @@ GUIDE = [
 **איך מתחילים:** בלוח של המשכפל → בוחרים חשבון בתפריט → 🟢 הדלק → פותחים עסקה כרגיל."""),
     ("🎛 הכפתורים", 0x95a5a6, """\
 🟢 **הדלק / 🔴 כבה** - כבוי = לא משכפל עסקאות **חדשות**. קבוצות שכבר פתוחות ממשיכות לקבל סנכרון סטופ.
+גם מהמסחר: **Buy Limit במחיר 1000 = כבה**, **Buy Limit במחיר 2000 = הדלק** (כל לוט). ההזמנה נמחקת תוך שנייה-שתיים - זה הסימן שבוצע; אם היא נשארה, השרת לא קיבל אותה.
 ⚙️ **הגדרות** - כמה עסקאות בסולם (2-10), מרחק בין TP-ים בדולרים, ומקסימום אונקיות לכל הסולם בחשבון.
 🛡 **סטופ** - סטופ אוטומטי (עסקה שנפתחה בלי SL מקבלת SL במרחק הזה, למשל 10$), BE offset (כמה מעבר לכניסה \
 הסטופ נכנס, למשל 0.5$ = נועל 0.5$ לאונקיה), ונעילת TP1 במצב "שני שלבים".

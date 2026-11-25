@@ -86,6 +86,8 @@ PARAMS = dict(
     manual_tags="",             # strategyId נוספים שנחשבים ידני, מופרדים בפסיק (בדיקות: key-undefined = API בלי strategy)
     tp_hit_slack=0.3,           # עסקה שנעלמה נחשבת TP אם המחיר הכי טוב שנראה הגיע עד כדי כך ל-TP שלה (המחיר נדגם כל ~2 שניות)
     sl_retry_seconds=4.0,       # אם ה-SL לא התעדכן אחרי X שניות - מנסים שוב / דרך אחרת
+    cmd_off_price=1000.0,       # Buy Limit בדיוק במחיר הזה (מהמסחר) = כיבוי; השירות מוחק את ההזמנה (0 = בלי)
+    cmd_on_price=2000.0,        # Buy Limit בדיוק במחיר הזה = הדלקה
 )
 
 TRANSLATIONS = {
@@ -109,6 +111,10 @@ TRANSLATIONS = {
         "news_expired": "⌛ <b>פקודות חדשות לא נתפסו - בוטלו</b>",
         "news_cancel": "🗑 <b>פקודות חדשות בוטלו</b>",
         "news_slip": "📉 <b>פקודת חדשות נתפסה רחוק מהמחיר שלה</b>",
+        "cmd_off": "🔴 <b>כובה מהמסחר</b>",
+        "cmd_on": "🟢 <b>הופעל מהמסחר</b>",
+        "cmd_same": "כבר היה במצב הזה",
+        "cmd_left": "ההזמנה לא נמחקה - מחק אותה בעצמך",
         "error": "⚠️ <b>שגיאה</b>",
         "dry": "(מצב בדיקה - לא נשלחה פקודה)",
         "auto": "אוטומטי", "cap": "מוגבל ל-", "side": "כיוון", "qty": "לוט", "price": "מחיר", "tps": "TP", "sl": "SL", "count": "עסקאות",
@@ -133,6 +139,10 @@ TRANSLATIONS = {
         "news_expired": "⌛ <b>News orders not filled - cancelled</b>",
         "news_cancel": "🗑 <b>News orders cancelled</b>",
         "news_slip": "📉 <b>News order filled far from its price</b>",
+        "cmd_off": "🔴 <b>Turned off from the terminal</b>",
+        "cmd_on": "🟢 <b>Turned on from the terminal</b>",
+        "cmd_same": "was already so",
+        "cmd_left": "the order was not deleted - delete it yourself",
         "error": "⚠️ <b>Error</b>",
         "dry": "(dry run - no order sent)",
         "auto": "auto", "cap": "cap", "side": "Side", "qty": "Lot", "price": "Price", "tps": "TP", "sl": "SL", "count": "Trades",
@@ -320,6 +330,7 @@ class LadderManager:
         self.strategy = {}      # "p:<id>" / "o:<id>" -> strategyId ("" = manual), resolved via REST
         self.requests = []      # work the Discord panel asks for, run on this thread at the next tick (see request)
         self.req_lock = threading.Lock()
+        self.cmd_done = set()   # command orders (cmd_off_price / cmd_on_price) already acted on
 
     # ==================================================================
     # General helpers
@@ -1246,6 +1257,7 @@ class LadderManager:
         if snap is None:
             return
         positions, pending = snap
+        pending = self._commands(pending)
         seen_p = set(self.state["seen_positions"])
         seen_o = set(self.state["seen_orders"])
 
@@ -1292,7 +1304,47 @@ class LadderManager:
                        for tag, g in self.state["groups"].items()],
         }
 
+    def _command(self, o):
+        """True/False for an on/off command order: the user's Buy Limit at exactly cmd_on_price / cmd_off_price."""
+        if not (o["open"] and o["type"] == "limit" and o["side"] == "buy" and self._is_manual(o["strategy"])):
+            return None
+        for price, value in ((self.p["cmd_off_price"], False), (self.p["cmd_on_price"], True)):
+            if price and abs(o["price"] - price) < 0.005:
+                return value
+        return None
+
+    def _commands(self, pending):
+        """Turn on/off from the terminal: act on a command order, delete it (the sign it was done) and never ladder it."""
+        self.cmd_done = {x for x in self.cmd_done if x in pending}
+        rest = {}
+        for oid, o in pending.items():
+            value = self._command(o)
+            if value is None:
+                rest[oid] = o
+                continue
+            if oid in self.cmd_done:
+                continue
+            self.cmd_done.add(oid)
+            same = self.p["enabled"] == value
+            if self.on_command:
+                self.on_command(value)      # the Discord panel saves it and shows it
+            else:
+                self.p["enabled"] = value
+            try:
+                deleted = self._retry_429(self._delete_order, oid)
+            except Exception as exc:
+                log.warning(f"delete command order {oid}: {exc}")
+                deleted = False
+            lines = [f"Buy Limit @{o['price']:g} · #{oid}"]
+            if same:
+                lines.append(self._t("cmd_same"))
+            if not deleted:
+                lines.append(self._t("cmd_left"))
+            self._broadcast(self._t("cmd_on" if value else "cmd_off"), lines)
+        return rest
+
     summary = None      # last tick's view, read by the Discord panel
+    on_command = None   # set by the Discord panel: called with True/False when a command order turns it on/off
     on_alert = None     # set by the Discord panel: (header, lines) of errors / startup
 
     def _single_instance(self):
